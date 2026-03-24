@@ -1,0 +1,120 @@
+"""
+TileLang算子模板 - your_op_name
+
+该文件提供了一个TileLang算子的基础模板。
+请根据实际算子需求修改以下内容：
+1. 算子名称（your_op_name -> 实际算子名）
+2. 输入/输出tensor的shape和dtype
+3. kernel计算逻辑
+4. 性能优化参数
+"""
+
+import tilelang
+import tilelang.language as T
+
+
+@tilelang.jit(out_idx=[-1])  # out_idx指定输出tensor的索引，-1表示最后一个
+def your_op_name(
+    M: int,
+    N: int,
+    K: int,
+    block_M: int = 64,
+    block_N: int = 64,
+    block_K: int = 32,
+    num_stages: int = 2,
+    threads: int = 128,
+    dtype: T.dtype = T.float16,
+    accum_dtype: T.dtype = T.float32,
+):
+    """
+    your_op_name算子的TileLang实现
+
+    参数说明:
+        M, N, K: 矩阵维度
+        block_M, block_N, block_K: tiling参数
+        num_stages: 流水线深度（0表示不使用流水线）
+        threads: 每个block的线程数
+        dtype: 输入/输出数据类型
+        accum_dtype: 累加数据类型
+
+    返回:
+        编译后的kernel函数
+    """
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),      # 输入tensor A
+        B: T.Tensor((K, N), dtype),      # 输入tensor B
+        C: T.Tensor((M, N), dtype),      # 输出tensor C
+    ):
+        # 定义kernel的block维度
+        # T.ceildiv用于向上取整除法，确定需要多少个block
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            # 分配shared memory用于存储tile数据
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+
+            # 分配fragment（寄存器）用于累加结果
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+            # 清空累加器
+            T.clear(C_local)
+
+            # 使用流水线进行分块计算
+            # T.Pipelined实现software pipelining，可以隐藏内存延迟
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                # 从global memory拷贝数据到shared memory
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+
+                # 执行分块矩阵乘法
+                T.gemm(A_shared, B_shared, C_local)
+
+            # 将结果从fragment拷贝回global memory
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+def main():
+    """测试入口函数"""
+    # 设置测试参数
+    M, N, K = 1024, 1024, 1024
+    block_M, block_N, block_K = 128, 128, 32
+
+    # 编译kernel
+    kernel = your_op_name(M, N, K, block_M, block_N, block_K)
+
+    import torch
+
+    # 准备输入数据
+    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+
+    # 调用kernel
+    c = kernel(a, b)
+
+    # 参考实现
+    ref_c = a @ b
+
+    # 验证结果
+    torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+    print("Correctness check passed!")
+
+    # 获取生成的CUDA源码
+    print("Generated CUDA Source:")
+    print(kernel.get_kernel_source())
+
+    # 性能测试
+    profiler = kernel.get_profiler()
+    latency = profiler.do_bench()
+    print(f"TileLang Latency: {latency:.3f} ms")
+
+    # 计算TFlops
+    flops = 2 * M * N * K
+    tflops = flops / latency * 1e-9
+    print(f"TileLang TFlops: {tflops:.2f}")
+
+
+if __name__ == "__main__":
+    main()
