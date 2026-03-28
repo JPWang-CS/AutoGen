@@ -61,6 +61,11 @@ AutoGen/
 
 **触发条件**：用户提出"生成benchmark/性能测试/性能对比"
 
+### tl-op-hardware-constraints
+检查算子代码是否符合不同NPU（如910B、910A、310P等）的硬件约束。
+
+**触发条件**：用户提出"检查硬件约束/验证NPU限制/SOC硬件上限"
+
 ## TileLang简介
 
 Tile Language (tile-lang) 是一个简洁的领域特定语言，旨在简化高性能GPU/CPU kernel（如GEMM、Dequant GEMM、FlashAttention、LinearAttention）的开发。通过采用Python语法并基于TVM构建编译器基础设施，tile-lang允许开发者专注于生产力，同时不牺牲低级优化。

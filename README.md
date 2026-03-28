@@ -2,6 +2,27 @@
 
 TileLang算子自动生成工具集，提供基于Claude Code的skill提示词和相关模板。
 
+## 安装依赖
+
+### NVIDIA GPU (CUDA)
+
+```bash
+pip install torch tilelang
+```
+
+### 华为昇腾NPU
+
+```bash
+# 安装 torch-npu (请根据CANN版本选择)
+pip install torch-npu
+
+# 安装 TileLang
+pip install tilelang
+
+# 安装 TileLang-Ascend 后端
+pip install git+https://github.com/tile-ai/tilelang-ascend
+```
+
 ## 概述
 
 本仓库提供了一套完整的skill提示词，用于自动生成TileLang算子的完整实现，包括：
