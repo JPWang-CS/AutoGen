@@ -23,14 +23,6 @@ def vector_add(
 
     计算: C = A + B
     要求 N 是 block_N 的整数倍。
-
-    参数:
-        N: 向量长度
-        block_N: 每个核处理的元素数量
-        dtype: 数据类型 ("float16", "float32")
-
-    返回:
-        编译后的kernel函数
     """
     n_num = N // block_N
 
@@ -40,8 +32,8 @@ def vector_add(
         B: T.Tensor((N,), dtype),
         C: T.Tensor((N,), dtype),
     ):
-        # NPU kernel: 只支持单维度
-        with T.Kernel(n_num, is_npu=True) as (cid,):
+        # NPU kernel: 只支持单维度，返回2个值需要解包
+        with T.Kernel(n_num, is_npu=True) as (cid, _):
             A_shared = T.alloc_shared((block_N,), dtype)
             B_shared = T.alloc_shared((block_N,), dtype)
             C_local = T.alloc_fragment((block_N,), dtype)
@@ -61,7 +53,7 @@ def vector_add(
     return main
 
 
-# vector_add_simple 与 vector_add 相同（不处理尾部）
+# vector_add_simple 与 vector_add 相同
 vector_add_simple = vector_add
 
 
@@ -91,8 +83,8 @@ def vector_add_2d(
         B: T.Tensor((M, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        # NPU kernel: 只支持单维度，使用线性索引
-        with T.Kernel(total_blocks, is_npu=True) as (cid,):
+        # NPU kernel: 只支持单维度，返回2个值需要解包
+        with T.Kernel(total_blocks, is_npu=True) as (cid, _):
             # 从线性索引计算 2D block 坐标
             by = cid // num_blocks_n
             bx = cid % num_blocks_n
