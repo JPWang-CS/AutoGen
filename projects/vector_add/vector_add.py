@@ -23,31 +23,31 @@ def vector_add(N: int, block_N: int = 256, dtype: str = "float16"):
     - block_N * sizeof(dtype) * 3 <= UB容量 (~2MB)
     - block_N 需满足32字节对齐
     """
+    # 使用 2D shape (N, 1) 来适配 NPU 的 2D copy
     @T.prim_func
     def main(
-        A: T.Tensor((N,), dtype),
-        B: T.Tensor((N,), dtype),
-        C: T.Tensor((N,), dtype),
+        A: T.Tensor((N, 1), dtype),
+        B: T.Tensor((N, 1), dtype),
+        C: T.Tensor((N, 1), dtype),
     ):
-        # NPU kernel 使用单维度block，is_npu=True 返回 (cid, _)
         with T.Kernel(N // block_N, is_npu=True) as (cid, _):
-            # NPU内存分配
-            A_shared = T.alloc_shared((block_N,), dtype)
-            B_shared = T.alloc_shared((block_N,), dtype)
-            C_local = T.alloc_fragment((block_N,), dtype)
+            # NPU内存分配 - 使用 2D shape
+            A_shared = T.alloc_shared((block_N, 1), dtype)
+            B_shared = T.alloc_shared((block_N, 1), dtype)
+            C_local = T.alloc_fragment((block_N, 1), dtype)
 
             start_idx = cid * block_N
 
-            # 数据搬运: Global Memory -> UB
-            T.copy(A[start_idx : start_idx + block_N], A_shared)
-            T.copy(B[start_idx : start_idx + block_N], B_shared)
+            # 数据搬运: 使用 2D 索引
+            T.copy(A[start_idx, 0], A_shared)
+            T.copy(B[start_idx, 0], B_shared)
 
             # 计算: 逐元素加法
             for i in T.Parallel(block_N):
-                C_local[i] = A_shared[i] + B_shared[i]
+                C_local[i, 0] = A_shared[i, 0] + B_shared[i, 0]
 
-            # 数据搬运: 直接从 local -> Global Memory
-            T.copy(C_local, C[start_idx : start_idx + block_N])
+            # 数据搬运
+            T.copy(C_local, C[start_idx, 0])
 
     return main
 
@@ -112,17 +112,17 @@ def main():
     # 测试参数
     N = 1024 * 1024  # 1M elements
 
-    # 编译 1D kernel
+    # 编译 1D kernel (内部使用 2D shape)
     kernel = vector_add(N, block_N=256, dtype="float16")
 
-    # 准备输入数据 (NPU)
-    a = torch.randn(N, device="npu", dtype=torch.float16)
-    b = torch.randn(N, device="npu", dtype=torch.float16)
+    # 准备输入数据 (NPU) - reshape to (N, 1) for kernel
+    a = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
+    b = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
 
     # 调用 kernel
     c = kernel(a, b)
 
-    # 精度对比在CPU上进行
+    # 精度对比在CPU上进行 - squeeze back to 1D
     ref_c = a.cpu() + b.cpu()
     torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
     print("1D Vector Add passed!")

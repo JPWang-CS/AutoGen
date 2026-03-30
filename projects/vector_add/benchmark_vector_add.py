@@ -36,8 +36,9 @@ def benchmark(N: int, block_N: int, warmup: int, rep: int, simple: bool = False)
     else:
         kernel = vector_add(N, block_N=block_N, dtype="float16")
 
-    a = torch.randn(N, device="npu", dtype=torch.float16)
-    b = torch.randn(N, device="npu", dtype=torch.float16)
+    # 使用 (N, 1) shape 适配 NPU kernel
+    a = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
+    b = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
 
     # 正确性验证 (CPU对比)
     c = kernel(a, b)

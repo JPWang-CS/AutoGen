@@ -47,8 +47,9 @@ class TestVectorAdd:
         N = 1024
         kernel = vector_add(N, block_N=256, dtype="float16")
 
-        a = torch.randn(N, device="npu", dtype=torch.float16)
-        b = torch.randn(N, device="npu", dtype=torch.float16)
+        # 使用 (N, 1) shape 适配 NPU kernel
+        a = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
+        b = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
 
         c = kernel(a, b)
 
@@ -61,8 +62,8 @@ class TestVectorAdd:
         N = 1024
         kernel = vector_add(N, block_N=256, dtype="float32")
 
-        a = torch.randn(N, device="npu", dtype=torch.float32)
-        b = torch.randn(N, device="npu", dtype=torch.float32)
+        a = torch.randn(N, device="npu", dtype=torch.float32).unsqueeze(1)
+        b = torch.randn(N, device="npu", dtype=torch.float32).unsqueeze(1)
 
         c = kernel(a, b)
 
@@ -74,8 +75,8 @@ class TestVectorAdd:
         N = 1024
         kernel = vector_add(N, block_N=256, dtype="float16")
 
-        a = torch.randn(N, device="npu", dtype=torch.float16)
-        b = torch.randn(N, device="npu", dtype=torch.float16)
+        a = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
+        b = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
 
         c = kernel(a, b)
 
@@ -95,8 +96,8 @@ class TestVectorAdd:
         """测试不同大小的向量"""
         kernel = vector_add(N, block_N=256, dtype="float16")
 
-        a = torch.randn(N, device="npu", dtype=torch.float16)
-        b = torch.randn(N, device="npu", dtype=torch.float16)
+        a = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
+        b = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
 
         c = kernel(a, b)
 
@@ -109,8 +110,8 @@ class TestVectorAdd:
         N = 65536
         kernel = vector_add(N, block_N=block_N, dtype="float16")
 
-        a = torch.randn(N, device="npu", dtype=torch.float16)
-        b = torch.randn(N, device="npu", dtype=torch.float16)
+        a = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
+        b = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
 
         c = kernel(a, b)
 
