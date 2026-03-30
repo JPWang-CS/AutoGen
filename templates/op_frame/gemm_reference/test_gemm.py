@@ -1,9 +1,9 @@
 """
-TileLang-Ascend GEMM测试 - 参考实现
+TileLang-Ascend GEMM测试 - 参考实现 (NPU专用)
 
 完整的GEMM单元测试，可作为其他算子测试的参考。
 
-支持设备：NPU (华为昇腾), CUDA (NVIDIA GPU)
+所有计算在NPU上执行，精度对比在CPU上进行。
 """
 
 import torch
@@ -11,58 +11,78 @@ import pytest
 import tilelang
 import tilelang.language as T
 
-from gemm import gemm, gemm_npu, gemm_cuda, gemm_npu_with_ub, gemm_cuda_with_swizzle, get_device, setup_device
+from gemm import gemm, gemm_with_ub, gemm_transposed_b
 
 
-# 模块级设备检测
-DEVICE = get_device()
+# ============================================================================
+# 测试辅助函数
+# ============================================================================
+
+def npu_available():
+    """检查NPU是否可用"""
+    try:
+        import torch_npu
+        return torch.npu.is_available()
+    except ImportError:
+        return False
 
 
+def setup_npu():
+    """设置NPU设备"""
+    import torch_npu
+    torch.npu.set_device(0)
+
+
+# ============================================================================
+# 测试类
+# ============================================================================
+
+@pytest.mark.skipif(not npu_available(), reason="NPU not available")
 class TestGemm:
-    """GEMM算子测试类"""
+    """GEMM算子NPU测试类"""
 
     def setup_method(self):
-        """每个测试方法前的设置"""
-        setup_device(DEVICE)
+        setup_npu()
 
     def test_basic_correctness(self):
         """基础正确性测试"""
         M, N, K = 128, 128, 128
         kernel = gemm(M, N, K)
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
         c = kernel(a, b)
-        ref_c = a @ b
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        # 精度对比在CPU上进行
+        ref_c = a.cpu() @ b.cpu()
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
     def test_float16(self):
         """float16数据类型测试"""
         M, N, K = 256, 256, 256
-        kernel = gemm(M, N, K, dtype=T.float16)
+        kernel = gemm(M, N, K, dtype="float16")
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu()
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
     def test_float32(self):
         """float32数据类型测试"""
         M, N, K = 256, 256, 256
-        kernel = gemm(M, N, K, dtype=T.float32, accum_dtype=T.float32)
+        kernel = gemm(M, N, K, dtype="float32", accum_dtype="float32")
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float32)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float32)
+        a = torch.randn(M, K, device="npu", dtype=torch.float32)
+        b = torch.randn(K, N, device="npu", dtype=torch.float32)
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu()
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("M,N,K", [
         (64, 64, 64),
@@ -77,13 +97,13 @@ class TestGemm:
         """参数化测试不同shape"""
         kernel = gemm(M, N, K)
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu()
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("M,N,K", [
         (1024, 512, 256),
@@ -95,13 +115,13 @@ class TestGemm:
         """非方阵测试"""
         kernel = gemm(M, N, K)
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu()
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("block_M,block_N,block_K", [
         (64, 64, 32),
@@ -115,13 +135,13 @@ class TestGemm:
 
         kernel = gemm(M, N, K, block_M, block_N, block_K)
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu()
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("num_stages", [0, 1, 2])
     def test_pipeline_stages(self, num_stages):
@@ -130,99 +150,55 @@ class TestGemm:
 
         kernel = gemm(M, N, K, num_stages=num_stages)
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu()
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
 
-class TestGemmNpu:
-    """NPU专用GEMM测试类"""
+@pytest.mark.skipif(not npu_available(), reason="NPU not available")
+class TestGemmWithUB:
+    """NPU Unified Buffer GEMM测试"""
 
     def setup_method(self):
-        """每个测试方法前的设置"""
-        if DEVICE != "npu":
-            pytest.skip("NPU not available")
-        setup_device(DEVICE)
+        setup_npu()
 
-    def test_npu_basic(self):
-        """NPU基础测试"""
+    def test_with_ub(self):
+        """Unified Buffer测试"""
         M, N, K = 128, 128, 128
-        kernel = gemm_npu(M, N, K)
+        kernel = gemm_with_ub(M, N, K)
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu()
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-
-    def test_npu_with_ub(self):
-        """NPU Unified Buffer测试"""
-        M, N, K = 128, 128, 128
-        kernel = gemm_npu_with_ub(M, N, K)
-
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
-
-        c = kernel(a, b)
-        ref_c = a @ b
-
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
 
-class TestGemmCuda:
-    """CUDA专用GEMM测试类"""
+@pytest.mark.skipif(not npu_available(), reason="NPU not available")
+class TestGemmTransposedB:
+    """转置B矩阵GEMM测试"""
 
     def setup_method(self):
-        """每个测试方法前的设置"""
-        if DEVICE != "cuda":
-            pytest.skip("CUDA not available")
-        setup_device(DEVICE)
+        setup_npu()
 
-    def test_cuda_basic(self):
-        """CUDA基础测试"""
+    def test_transposed_b(self):
+        """转置B矩阵测试"""
         M, N, K = 128, 128, 128
-        kernel = gemm_cuda(M, N, K)
+        kernel = gemm_transposed_b(M, N, K)
 
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
-
-        c = kernel(a, b)
-        ref_c = a @ b
-
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-
-    def test_cuda_with_swizzle(self):
-        """CUDA swizzle优化测试"""
-        M, N, K = 1024, 1024, 1024
-        kernel = gemm_cuda_with_swizzle(M, N, K, enable_swizzle=True)
-
-        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(M, K, device="npu", dtype=torch.float16)
+        b = torch.randn(N, K, device="npu", dtype=torch.float16)  # 注意shape
 
         c = kernel(a, b)
-        ref_c = a @ b
+        ref_c = a.cpu() @ b.cpu().T
 
-        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-
-
-class TestDeviceDetection:
-    """设备检测测试类"""
-
-    def test_get_device(self):
-        """测试设备检测功能"""
-        device = get_device()
-        assert device in ["npu", "cuda", "cpu"]
-
-    def test_setup_device(self):
-        """测试设备设置功能"""
-        device = setup_device()
-        assert device in ["npu", "cuda", "cpu"]
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

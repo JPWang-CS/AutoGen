@@ -67,13 +67,12 @@ def main():
     parser.add_argument("--autotune", action="store_true")
     args = parser.parse_args()
 
-    # 默认配置
+    # 默认配置 (NPU)
     default_config = {
         "block_M": 128,
         "block_N": 128,
         "block_K": 32,
         "num_stages": 2,
-        "threads": 128,
     }
 
     if args.autotune:
@@ -117,25 +116,23 @@ def run_autotune(M, N, K):
     return best_config
 
 def get_tune_configs():
-    """获取调优配置空间"""
+    """获取NPU调优配置空间"""
     import itertools
 
-    block_M = [64, 128, 256]
-    block_N = [64, 128, 256]
+    block_M = [64, 128]
+    block_N = [64, 128]
     block_K = [32, 64]
-    num_stages = [0, 1, 2, 3]
-    threads = [128, 256]
+    num_stages = [0, 1, 2]
 
     configs = []
-    for bm, bn, bk, ns, t in itertools.product(
-        block_M, block_N, block_K, num_stages, threads
+    for bm, bn, bk, ns in itertools.product(
+        block_M, block_N, block_K, num_stages
     ):
         configs.append({
             "block_M": bm,
             "block_N": bn,
             "block_K": bk,
             "num_stages": ns,
-            "threads": t,
         })
     return configs
 

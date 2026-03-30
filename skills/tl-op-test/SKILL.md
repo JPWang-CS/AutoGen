@@ -85,8 +85,9 @@ if __name__ == "__main__":
 
 ### 3. 输入数据生成
 - 使用 `torch.randn` 生成随机数据
-- 使用 `.cuda()` 将数据放到GPU上
+- 使用 `device="npu"` 将数据放到NPU上
 - 使用 `.half()` 或 `.bfloat16()` 转换数据类型
+- 精度对比在CPU上进行：`c.cpu()` 与 `ref_c` 对比
 
 ### 4. 参数化测试
 - 使用 `@pytest.mark.parametrize` 覆盖多种场景

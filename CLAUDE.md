@@ -1,6 +1,6 @@
-# TileLang-Ascend AutoGen 仓库
+# TileLang-Ascend AutoGen 仓库 (NPU专用)
 
-本仓库提供TileLang算子自动生成的skill提示词和相关模板。
+本仓库提供TileLang-Ascend NPU算子自动生成的skill提示词和相关模板。所有算子运行在华为昇腾NPU上，精度对比在CPU上进行。
 
 ## 仓库结构
 
@@ -68,14 +68,14 @@ AutoGen/
 
 ## TileLang简介
 
-Tile Language (tile-lang) 是一个简洁的领域特定语言，旨在简化高性能GPU/CPU kernel（如GEMM、Dequant GEMM、FlashAttention、LinearAttention）的开发。通过采用Python语法并基于TVM构建编译器基础设施，tile-lang允许开发者专注于生产力，同时不牺牲低级优化。
+Tile Language (tile-lang) 是一个简洁的领域特定语言，旨在简化高性能NPU kernel（如GEMM、Dequant GEMM、FlashAttention、LinearAttention）的开发。通过采用Python语法并基于TVM构建编译器基础设施，tile-lang允许开发者专注于生产力，同时不牺牲低级优化。
 
 ### 核心概念
 
 1. **JIT编译**：使用 `@tilelang.jit` 装饰器定义可JIT编译的kernel
-2. **内存层次**：`T.alloc_shared` (shared memory), `T.alloc_fragment` (寄存器)
-3. **核心原语**：`T.copy`, `T.gemm`, `T.clear`, `T.reduce_max`, `T.reduce_sum`
-4. **并行编程**：`T.Kernel`, `T.Parallel`, `T.Pipelined`
+2. **NPU内存层次**：`T.alloc_ub` (Unified Buffer), `T.alloc_L1` (L1), `T.alloc_fragment` (寄存器)
+3. **核心原语**：`T.copy`, `T.gemm`, `T.clear`, `T.reduce_max`, `T.reduce_sum`, `T.npuir_add`, `T.npuir_mul`
+4. **并行编程**：`T.Kernel(is_npu=True)`, `T.Parallel`, `T.Pipelined`
 
 ### 示例代码
 
@@ -83,34 +83,43 @@ Tile Language (tile-lang) 是一个简洁的领域特定语言，旨在简化高
 import tilelang
 import tilelang.language as T
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(out_idx=[-1], target="npuir")
 def matmul(M, N, K, block_M=64, block_N=64, block_K=32):
     @T.prim_func
     def gemm(
-        A: T.Tensor((M, K), T.float16),
-        B: T.Tensor((K, N), T.float16),
-        C: T.Tensor((M, N), T.float16),
+        A: T.Tensor((M, K), "float16"),
+        B: T.Tensor((K, N), "float16"),
+        C: T.Tensor((M, N), "float16"),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), T.float16)
-            B_shared = T.alloc_shared((block_K, block_N), T.float16)
-            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+        with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (cid, _):
+            by = cid // T.ceildiv(N, block_N)
+            bx = cid % T.ceildiv(N, block_N)
+            A_ub = T.alloc_ub((block_M, block_K), "float16")
+            B_ub = T.alloc_ub((block_K, block_N), "float16")
+            C_local = T.alloc_fragment((block_M, block_N), "float32")
 
-            T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_local)
+                T.copy(A[by * block_M, k * block_K], A_ub)
+                T.copy(B[k * block_K, bx * block_N], B_ub)
+                T.gemm(A_ub, B_ub, C_local, initC=(k == 0))
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return gemm
 
 # 使用
+import torch
+import torch_npu
+torch.npu.set_device(0)
+
 kernel = matmul(1024, 1024, 1024)
-a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
-b = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+a = torch.randn(1024, 1024, device="npu", dtype=torch.float16)
+b = torch.randn(1024, 1024, device="npu", dtype=torch.float16)
 c = kernel(a, b)
+
+# 精度对比在CPU上进行
+ref_c = a.cpu() @ b.cpu()
+torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 ```
 
 ## 开发流程

@@ -9,11 +9,10 @@ description: 用户新增TileLang-Ascend算子时，提供输入模板到 claude
 
 ## 支持设备
 
-TileLang-Ascend算子支持以下设备：
-- **NPU** - 华为昇腾NPU (默认，需要安装 torch_npu 和 tilelang-ascend)
-- **CUDA** - NVIDIA GPU (备选)
+TileLang-Ascend算子仅支持NPU设备：
+- **NPU** - 华为昇腾NPU (需要安装 torch_npu 和 tilelang-ascend)
 
-生成的代码会自动检测可用设备，优先级：NPU > CUDA > CPU。
+所有计算在NPU上执行，精度对比在CPU上进行。
 
 ## 工作流
 1. 确认需要生成的算子类型（例如：GEMM、FlashAttention、DequantizeGEMM、VectorAdd等）。
@@ -75,18 +74,17 @@ def my_kernel(M, N, K, block_M, block_N, block_K, dtype=T.float16):
 
 ### 内存层次 (NPU专用)
 
-TileLang-Ascend 使用不同的内存分配原语：
+TileLang-Ascend 使用以下NPU内存分配原语：
 
-- `T.alloc_ub`: 分配Unified Buffer (UB)，类似于shared memory
+- `T.alloc_ub`: 分配Unified Buffer (UB)，NPU片上高速缓存
 - `T.alloc_L1`: 分配L1 buffer
 - `T.alloc_L0A`, `T.alloc_L0B`, `T.alloc_L0C`: 分配L0 buffer (用于Cube单元)
-- `T.alloc_shared`: 分配shared memory (兼容CUDA模式)
-- `T.alloc_fragment`: 分配寄存器fragment (兼容CUDA模式)
+- `T.alloc_fragment`: 分配寄存器fragment
 
 ### 核心原语
 
 - `T.copy`: 数据拷贝
-- `T.gemm`: 矩阵乘法 (CUDA模式或NPU Developer Mode)
+- `T.gemm`: 矩阵乘法 (NPU Developer Mode)
 - `T.gemm_v0`: NPU专用矩阵乘法，支持init参数
 - `T.mma`: NPU矩阵乘累加
 - `T.clear`: 清空buffer
@@ -111,9 +109,11 @@ with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (ci
 ```
 
 ### 数据类型
-- `T.float16`, `T.float32`, `T.bfloat16`
-- `T.int8`, `T.int32`
-- `T.float8_e4m3fn`, `T.float8_e5m2`
+
+dtype参数使用字符串类型：
+- `"float16"`, `"float32"`, `"bfloat16"`
+- `"int8"`, `"int32"`
+- `"float8_e4m3fn"`, `"float8_e5m2"`
 
 ## NPU专用示例
 
@@ -172,15 +172,16 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
             by = cid // T.ceildiv(N, block_N)
             bx = cid % T.ceildiv(N, block_N)
 
-            A_shared = T.alloc_shared((block_M, block_K), dtype)
-            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            # 使用Unified Buffer (NPU专用)
+            A_ub = T.alloc_ub((block_M, block_K), dtype)
+            B_ub = T.alloc_ub((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.copy(A[by * block_M, k * block_K], A_ub)
+                T.copy(B[k * block_K, bx * block_N], B_ub)
                 # 使用initC参数初始化累加器
-                T.gemm(A_shared, B_shared, C_local, initC=(k == 0))
+                T.gemm(A_ub, B_ub, C_local, initC=(k == 0))
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -226,28 +227,14 @@ def my_kernel(...):
 
 ## 设备检测
 
-生成的代码会自动包含设备检测函数：
+生成的代码使用NPU专用初始化：
 
 ```python
-def get_device():
-    """
-    自动检测可用设备
+import torch
+import torch_npu
 
-    返回:
-        "npu" - 华为昇腾NPU
-        "cuda" - NVIDIA GPU
-        "cpu" - CPU（后备）
-    """
-    import torch
-    try:
-        import torch_npu
-        if torch.npu.is_available():
-            return "npu"
-    except ImportError:
-        pass
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+# 设置NPU设备
+torch.npu.set_device(0)
 ```
 
 ## NPU使用说明
@@ -272,27 +259,25 @@ torch.npu.set_device(0)
 # 编译kernel
 compiled_kernel = tilelang.compile(func, target="npuir")
 
-# 准备数据
+# 准备数据 (NPU)
 a = torch.randn(M, K, device="npu", dtype=torch.float16)
 b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
 # 调用kernel
 c = compiled_kernel(a, b)
+
+# 精度对比在CPU上进行
+ref_c = a.cpu() @ b.cpu()
+torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 ```
 
 ### 数据准备
 
 ```python
-device = get_device()  # 自动检测为 "npu"
-
 # NPU tensor创建
-if device == "npu":
-    torch.npu.set_device(0)
-    a = torch.randn(M, K, device="npu", dtype=torch.float16)
-    b = torch.randn(K, N, device="npu", dtype=torch.float16)
-elif device == "cuda":
-    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
-    b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+torch.npu.set_device(0)
+a = torch.randn(M, K, device="npu", dtype=torch.float16)
+b = torch.randn(K, N, device="npu", dtype=torch.float16)
 ```
 
 ## NPU 硬件约束

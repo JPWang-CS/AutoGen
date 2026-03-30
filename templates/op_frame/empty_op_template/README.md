@@ -1,6 +1,6 @@
-# your_op_name
+# your_op_name (NPU专用)
 
-TileLang实现的your_op_name算子。
+TileLang-Ascend 实现的 your_op_name 算子，运行在华为昇腾NPU上。
 
 ## 算子描述
 
@@ -9,12 +9,14 @@ TileLang实现的your_op_name算子。
 - 算子的应用场景
 - 算子的输入输出规格
 
+所有计算在 NPU 上执行，精度对比在 CPU 上进行。
+
 ## 接口说明
 
 ### 函数签名
 
 ```python
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(out_idx=[-1], target="npuir")
 def your_op_name(
     M: int,
     N: int,
@@ -23,9 +25,8 @@ def your_op_name(
     block_N: int = 64,
     block_K: int = 32,
     num_stages: int = 2,
-    threads: int = 128,
-    dtype: T.dtype = T.float16,
-    accum_dtype: T.dtype = T.float32,
+    dtype: str = "float16",
+    accum_dtype: str = "float32",
 ):
     ...
 ```
@@ -41,9 +42,8 @@ def your_op_name(
 | block_N | int | 64 | N维度的tiling大小 |
 | block_K | int | 32 | K维度的tiling大小 |
 | num_stages | int | 2 | 流水线深度 |
-| threads | int | 128 | 每个block的线程数 |
-| dtype | T.dtype | T.float16 | 输入/输出数据类型 |
-| accum_dtype | T.dtype | T.float32 | 累加数据类型 |
+| dtype | str | "float16" | 输入/输出数据类型 |
+| accum_dtype | str | "float32" | 累加数据类型 |
 
 ### 输入/输出
 
@@ -56,12 +56,12 @@ def your_op_name(
 
 ## 使用示例
 
-### 基础用法
-
 ```python
 import torch
-import tilelang
+import torch_npu
 from your_op_name import your_op_name
+
+torch.npu.set_device(0)
 
 # 定义问题规模
 M, N, K = 1024, 1024, 1024
@@ -69,42 +69,26 @@ M, N, K = 1024, 1024, 1024
 # 编译kernel
 kernel = your_op_name(M, N, K)
 
-# 准备输入数据
-a = torch.randn(M, K, device="cuda", dtype=torch.float16)
-b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+# 准备输入数据 (NPU)
+a = torch.randn(M, K, device="npu", dtype=torch.float16)
+b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
 # 调用kernel
 c = kernel(a, b)
 
-# 参考实现验证
-ref_c = a @ b
-torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-```
-
-### 性能测试
-
-```python
-# 获取profiler
-profiler = kernel.get_profiler()
-
-# 测量延迟
-latency = profiler.do_bench()
-print(f"Latency: {latency:.3f} ms")
-
-# 计算TFlops
-flops = 2 * M * N * K
-tflops = flops / latency * 1e-9
-print(f"TFlops: {tflops:.2f}")
+# 精度对比在CPU上进行
+ref_c = a.cpu() @ b.cpu()
+torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 ```
 
 ## 文件结构
 
 ```
 your_op_name/
-├── your_op_name.py         # 核心kernel实现
-├── test_your_op_name.py    # 单元测试
+├── your_op_name.py           # 核心kernel实现 (NPU专用)
+├── test_your_op_name.py      # 单元测试
 ├── benchmark_your_op_name.py # 性能基准测试
-└── README.md               # 本文档
+└── README.md                 # 本文档
 ```
 
 ## 运行测试
@@ -123,22 +107,29 @@ python benchmark_your_op_name.py --M 4096 --N 4096 --K 4096
 python benchmark_your_op_name.py --M 4096 --N 4096 --K 4096 --autotune
 ```
 
-## 性能参考
+## NPU 硬件约束
 
-以下是在不同GPU上的性能参考数据：
+Tiling 参数受 NPU 硬件约束限制：
 
-| GPU | M=N=K | Latency (ms) | TFlops | Speedup vs PyTorch |
-|-----|-------|--------------|--------|-------------------|
-| A100 | 4096 | TBD | TBD | TBD |
-| H100 | 4096 | TBD | TBD | TBD |
+| 参数 | 约束 |
+|------|------|
+| UB 容量 | block_M * block_K * sizeof(dtype) <= UB容量 (~2MB) |
+| 分形对齐 | block_M, block_N, block_K 应为分形大小(16x16x16)的整数倍 |
+| 数据对齐 | 32字节对齐 (cacheline) |
+
+推荐配置：
+- **910B**: block_M=128, block_N=128, block_K=32
+- **310P**: block_M=64, block_N=64, block_K=32
 
 ## 注意事项
 
-1. 确保输入数据在CUDA设备上
+1. 确保输入数据在 NPU 设备上
 2. 数据类型需要与kernel定义的dtype一致
 3. 问题规模需要能被block size整除以获得最佳性能
+4. 精度对比始终在CPU上进行
 
 ## 参考
 
+- [TileLang-Ascend GitHub](https://github.com/tile-ai/tilelang-ascend)
 - [TileLang Documentation](https://tilelang.com/)
-- [TileLang GitHub](https://github.com/tile-ai/tilelang)
+- [TileLang-Ascend 开发指南](https://github.com/tile-ai/tilelang-ascend/blob/npuir/docs/开发指南.md)
