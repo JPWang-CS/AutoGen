@@ -21,7 +21,7 @@ from tilelang.autotuner import AutoTuner
 # GEMM 实现
 # ============================================================================
 
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def gemm(
     M: int,
     N: int,
@@ -82,7 +82,7 @@ def gemm(
     return main
 
 
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def gemm_with_ub(
     M: int,
     N: int,
@@ -125,7 +125,7 @@ def gemm_with_ub(
     return main
 
 
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def gemm_transposed_b(
     M: int,
     N: int,
@@ -223,7 +223,7 @@ def main():
 
         autotuner = (
             AutoTuner.from_kernel(kernel=kernel_fn, configs=get_configs())
-            .set_compile_args(out_idx=[-1], target="npuir")
+            .set_compile_args(out_idx=[-1])
             .set_profile_args(
                 supply_type=tilelang.TensorSupplyType.Integer,
                 ref_prog=ref_program,

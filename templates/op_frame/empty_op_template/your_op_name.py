@@ -17,7 +17,7 @@ import tilelang
 import tilelang.language as T
 
 
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def your_op_name(
     M: int,
     N: int,

@@ -40,9 +40,9 @@ TileLang-Ascend算子仅支持NPU设备：
 
 ### 两种编译后端
 
-TileLang-Ascend 支持两种编译后端：
-1. **AscendNPU IR (`target="npuir"`)** - 推荐用于大多数场景，Developer Mode
-2. **Ascend C & PTO (`target="ascendc"`)** - 用于底层优化，Expert Mode
+TileLang-Ascend 支持两种编译后端（通过环境变量或自动检测）：
+1. **AscendNPU IR** - 推荐用于大多数场景，Developer Mode（默认）
+2. **Ascend C & PTO** - 用于底层优化，Expert Mode
 
 ### 开发模式
 
@@ -57,7 +57,7 @@ TileLang-Ascend使用Python装饰器 `@tilelang.jit` 来定义可JIT编译的ker
 import tilelang
 import tilelang.language as T
 
-@tilelang.jit(out_idx=[-1], target="npuir")  # target指定为npuir
+@tilelang.jit(out_idx=[-1])  # target指定为npuir
 def my_kernel(M, N, K, block_M, block_N, block_K, dtype=T.float16):
     @T.prim_func
     def main(
@@ -120,7 +120,7 @@ dtype参数使用字符串类型：
 import tilelang
 import tilelang.language as T
 
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def vec_add(N, block_N, dtype="float16"):
     n_num = N // block_N
 
@@ -152,7 +152,7 @@ def vec_add(N, block_N, dtype="float16"):
 ### GEMM (NPU Developer Mode)
 
 ```python
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
     @T.prim_func
     def gemm(
@@ -196,7 +196,7 @@ for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
 ```python
 import tilelang
 pass_configs = {tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True}
-compiled_kernel = tilelang.compile(func, target="npuir", pass_configs=pass_configs)
+compiled_kernel = tilelang.compile(func, pass_configs=pass_configs)
 ```
 
 ### 手动同步
@@ -212,7 +212,7 @@ NPU专用同步原语：
 from tilelang.autotuner import *
 
 @autotune(configs=get_configs(), warmup=10, rep=10)
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def my_kernel(...):
     ...
 ```
@@ -249,7 +249,7 @@ import tilelang
 torch.npu.set_device(0)
 
 # 编译kernel
-compiled_kernel = tilelang.compile(func, target="npuir")
+compiled_kernel = tilelang.compile(func)
 
 # 准备数据 (NPU)
 a = torch.randn(M, K, device="npu", dtype=torch.float16)
@@ -306,7 +306,7 @@ b = torch.randn(K, N, device="npu", dtype=torch.float16)
 - 若输入信息不足，必须先列出假设。
 - 严格按照输入文档/模板中列出的参数生成代码，不得自行添加或删减任何参数。
 - 生成的代码需要遵循TileLang-Ascend的编程规范和最佳实践。
-- 默认使用 `target="npuir"` 和 `is_npu=True` 以确保NPU兼容性。
+- 默认使用 `is_npu=True` 标识NPU kernel，target由环境自动检测。
 - **生成的代码必须符合目标SOC的硬件上限**，参见 `skills/tl-op-hardware-constraints/Skill.md`。
 
 - **算子搬运和计算必须符合不同NPU（如910B等）的硬件限制**：

@@ -4,36 +4,34 @@ TileLang Vector Add 算子实现 (NPU专用)
 计算: C = A + B
 所有计算在NPU上执行，精度对比在CPU上进行。
 
-参考: tilelang/examples/elementwise/example_elementwise_add.py
-注意: NPU kernel 只支持单维度 block，需要用线性索引处理 2D 问题。
+参考: tilelang-ascend NPU编程规范
 """
 
 import tilelang
 import tilelang.language as T
 
 
-@tilelang.jit(out_idx=[-1], target="npuir")
-def vector_add(
-    N: int,
-    block_N: int = 256,
-    dtype: str = "float16",
-):
+@tilelang.jit(out_idx=[-1])
+def vector_add(N: int, block_N: int = 256, dtype: str = "float16"):
     """
-    1D Vector Add 的 TileLang NPU 实现
+    1D Vector Add 的 TileLang NPU实现
 
     计算: C = A + B
     要求 N 是 block_N 的整数倍。
-    """
-    n_num = N // block_N
 
+    NPU约束:
+    - block_N * sizeof(dtype) * 3 <= UB容量 (~2MB)
+    - block_N 需满足32字节对齐
+    """
     @T.prim_func
     def main(
         A: T.Tensor((N,), dtype),
         B: T.Tensor((N,), dtype),
         C: T.Tensor((N,), dtype),
     ):
-        # NPU kernel: 只支持单维度，返回2个值需要解包
-        with T.Kernel(n_num, is_npu=True) as (cid, _):
+        # NPU kernel 使用单维度block，is_npu=True 返回 (cid, _)
+        with T.Kernel(N // block_N, is_npu=True) as (cid, _):
+            # NPU内存分配
             A_shared = T.alloc_shared((block_N,), dtype)
             B_shared = T.alloc_shared((block_N,), dtype)
             C_local = T.alloc_fragment((block_N,), dtype)
@@ -41,12 +39,15 @@ def vector_add(
 
             start_idx = cid * block_N
 
+            # 数据搬运: Global Memory -> UB
             T.copy(A[start_idx : start_idx + block_N], A_shared)
             T.copy(B[start_idx : start_idx + block_N], B_shared)
 
+            # 计算: 逐元素加法
             for i in T.Parallel(block_N):
                 C_local[i] = A_shared[i] + B_shared[i]
 
+            # 数据搬运: UB -> Global Memory
             T.copy(C_local, C_shared)
             T.copy(C_shared, C[start_idx : start_idx + block_N])
 
@@ -57,21 +58,15 @@ def vector_add(
 vector_add_simple = vector_add
 
 
-@tilelang.jit(out_idx=[-1], target="npuir")
-def vector_add_2d(
-    M: int,
-    N: int,
-    block_M: int = 16,
-    block_N: int = 16,
-    dtype: str = "float16",
-):
+@tilelang.jit(out_idx=[-1])
+def vector_add_2d(M: int, N: int, block_M: int = 16, block_N: int = 16, dtype: str = "float16"):
     """
-    2D Tensor 加法的 NPU 实现
+    2D Tensor 加法 (NPU版本)
 
     计算: C = A + B，其中 A, B, C 的 shape 都是 (M, N)
     要求 M 是 block_M 的整数倍，N 是 block_N 的整数倍。
 
-    注意: NPU kernel 只支持单维度 block，因此使用线性索引。
+    NPU约束: 使用线性block索引，手动计算2D坐标
     """
     num_blocks_m = M // block_M
     num_blocks_n = N // block_N
@@ -83,23 +78,27 @@ def vector_add_2d(
         B: T.Tensor((M, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        # NPU kernel: 只支持单维度，返回2个值需要解包
+        # NPU kernel 使用单维度block
         with T.Kernel(total_blocks, is_npu=True) as (cid, _):
-            # 从线性索引计算 2D block 坐标
+            # 计算当前block的2D坐标
             by = cid // num_blocks_n
             bx = cid % num_blocks_n
 
+            # NPU内存分配
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_M, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), dtype)
 
+            # 数据搬运
             T.copy(A[by * block_M, bx * block_N], A_shared)
             T.copy(B[by * block_M, bx * block_N], B_shared)
 
+            # 计算
             for local_y, local_x in T.Parallel(block_M, block_N):
                 C_local[local_y, local_x] = A_shared[local_y, local_x] + B_shared[local_y, local_x]
 
+            # 数据搬运
             T.copy(C_local, C_shared)
             T.copy(C_shared, C[by * block_M, bx * block_N])
 
@@ -107,10 +106,11 @@ def vector_add_2d(
 
 
 def main():
-    """测试入口函数"""
+    """测试入口函数 (NPU版本)"""
     import torch
     import torch_npu
 
+    # 设置NPU设备
     torch.npu.set_device(0)
 
     # 测试参数
@@ -126,7 +126,7 @@ def main():
     # 调用 kernel
     c = kernel(a, b)
 
-    # 精度对比在 CPU 上进行
+    # 精度对比在CPU上进行
     ref_c = a.cpu() + b.cpu()
     torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
     print("1D Vector Add passed!")

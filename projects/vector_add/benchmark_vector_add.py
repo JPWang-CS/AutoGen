@@ -40,10 +40,7 @@ def benchmark(N: int, block_N: int, warmup: int, rep: int, simple: bool = False)
     b = torch.randn(N, device="npu", dtype=torch.float16)
 
     # 正确性验证 (CPU对比)
-    if simple:
-        c = kernel(a, b)
-    else:
-        c = kernel(a, b, torch.tensor(N, dtype=torch.int32))
+    c = kernel(a, b)
     ref_c = a.cpu() + b.cpu()
     torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
     print("Correctness check passed!")

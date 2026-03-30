@@ -76,7 +76,7 @@ def run_npu_autotune(M: int, N: int, K: int):
 
     autotuner = (
         AutoTuner.from_kernel(kernel=kernel_fn, configs=get_npu_configs())
-        .set_compile_args(out_idx=[-1], target="npuir")
+        .set_compile_args(out_idx=[-1])
         .set_profile_args(
             supply_type=tl.TensorSupplyType.Integer,
             ref_prog=ref_program,

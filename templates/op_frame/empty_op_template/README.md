@@ -16,7 +16,7 @@ TileLang-Ascend 实现的 your_op_name 算子，运行在华为昇腾NPU上。
 ### 函数签名
 
 ```python
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def your_op_name(
     M: int,
     N: int,

@@ -83,7 +83,7 @@ Tile Language (tile-lang) 是一个简洁的领域特定语言，旨在简化高
 import tilelang
 import tilelang.language as T
 
-@tilelang.jit(out_idx=[-1], target="npuir")
+@tilelang.jit(out_idx=[-1])
 def matmul(M, N, K, block_M=64, block_N=64, block_K=32):
     @T.prim_func
     def gemm(
