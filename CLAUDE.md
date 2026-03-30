@@ -73,8 +73,8 @@ Tile Language (tile-lang) 是一个简洁的领域特定语言，旨在简化高
 ### 核心概念
 
 1. **JIT编译**：使用 `@tilelang.jit` 装饰器定义可JIT编译的kernel
-2. **NPU内存层次**：`T.alloc_ub` (Unified Buffer), `T.alloc_L1` (L1), `T.alloc_fragment` (寄存器)
-3. **核心原语**：`T.copy`, `T.gemm`, `T.clear`, `T.reduce_max`, `T.reduce_sum`, `T.npuir_add`, `T.npuir_mul`
+2. **NPU内存层次**：`T.alloc_shared` (共享内存，npuir后端自动映射到UB), `T.alloc_fragment` (寄存器)
+3. **核心原语**：`T.copy`, `T.gemm`, `T.clear`, `T.reduce_max`, `T.reduce_sum`
 4. **并行编程**：`T.Kernel(is_npu=True)`, `T.Parallel`, `T.Pipelined`
 
 ### 示例代码
@@ -94,14 +94,14 @@ def matmul(M, N, K, block_M=64, block_N=64, block_K=32):
         with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (cid, _):
             by = cid // T.ceildiv(N, block_N)
             bx = cid % T.ceildiv(N, block_N)
-            A_ub = T.alloc_ub((block_M, block_K), "float16")
-            B_ub = T.alloc_ub((block_K, block_N), "float16")
+            A_shared = T.alloc_shared((block_M, block_K), "float16")
+            B_shared = T.alloc_shared((block_K, block_N), "float16")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
 
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
-                T.copy(A[by * block_M, k * block_K], A_ub)
-                T.copy(B[k * block_K, bx * block_N], B_ub)
-                T.gemm(A_ub, B_ub, C_local, initC=(k == 0))
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local, initC=(k == 0))
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 

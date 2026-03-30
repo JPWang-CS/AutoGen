@@ -64,18 +64,18 @@ def gemm(
             by = cid // T.ceildiv(N, block_N)
             bx = cid % T.ceildiv(N, block_N)
 
-            # 分配Unified Buffer (NPU专用)
-            A_ub = T.alloc_ub((block_M, block_K), dtype)
-            B_ub = T.alloc_ub((block_K, block_N), dtype)
+            # 分配shared memory (npuir后端自动映射到UB)
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
 
             # 分配fragment用于累加
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             # 使用流水线进行分块计算
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                T.copy(A[by * block_M, k * block_K], A_ub)
-                T.copy(B[k * block_K, bx * block_N], B_ub)
-                T.gemm(A_ub, B_ub, C_local, initC=(k == 0))
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local, initC=(k == 0))
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -97,7 +97,7 @@ def gemm_with_ub(
     """
     使用Unified Buffer的NPU GEMM实现
 
-    展示T.alloc_ub的使用方法
+    展示T.alloc_shared的使用方法
     """
 
     @T.prim_func
@@ -111,9 +111,9 @@ def gemm_with_ub(
             bx = cid % T.ceildiv(N, block_N)
 
             # 使用Unified Buffer (NPU专用)
-            A_ub = T.alloc_ub((block_M, block_K), dtype)
-            B_ub = T.alloc_ub((block_K, block_N), dtype)
-            C_ub = T.alloc_ub((block_M, block_N), accum_dtype)
+            A_ub = T.alloc_shared((block_M, block_K), dtype)
+            B_ub = T.alloc_shared((block_K, block_N), dtype)
+            C_ub = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(A[by * block_M, k * block_K], A_ub)
@@ -153,8 +153,8 @@ def gemm_transposed_b(
             by = cid // T.ceildiv(N, block_N)
             bx = cid % T.ceildiv(N, block_N)
 
-            A_ub = T.alloc_ub((block_M, block_K), dtype)
-            B_ub = T.alloc_ub((block_K, block_N), dtype)
+            A_ub = T.alloc_shared((block_M, block_K), dtype)
+            B_ub = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):

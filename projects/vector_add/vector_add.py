@@ -1,19 +1,15 @@
 """
-TileLang-Ascend Vector Add 算子实现 (NPU专用)
+TileLang Vector Add 算子实现 (NPU)
 
 计算: C = A + B
 所有计算在NPU上执行，精度对比在CPU上进行。
 
-参考: https://github.com/tile-ai/tilelang-ascend
+参考: tilelang/examples/elementwise/example_elementwise_add.py
 """
 
 import tilelang
 import tilelang.language as T
 
-
-# ============================================================================
-# NPU版本 Vector Add 实现
-# ============================================================================
 
 @tilelang.jit(out_idx=[-1], target="npuir")
 def vector_add(
@@ -22,17 +18,20 @@ def vector_add(
     dtype: str = "float16",
 ):
     """
-    Vector Add的TileLang-Ascend NPU实现
+    Vector Add 的 TileLang NPU 实现
 
     计算: C = A + B
 
     参数:
         N: 向量长度
         block_N: 每个核处理的元素数量
-        dtype: 数据类型 ("float16", "float32", "bfloat16")
+        dtype: 数据类型 ("float16", "float32")
 
     返回:
         编译后的kernel函数
+
+    注意:
+        NPU版本需要额外传入shape参数 (torch.tensor(N, dtype=torch.int32))
     """
     n_num = N // block_N
 
@@ -44,25 +43,21 @@ def vector_add(
         shape: T.int32,
     ):
         with T.Kernel(n_num, is_npu=True) as (cid, _):
-            # 分配Unified Buffer (NPU专用)
-            A_VEC = T.alloc_ub((block_N,), dtype)
-            B_VEC = T.alloc_ub((block_N,), dtype)
-            C_VEC = T.alloc_ub((block_N,), dtype)
+            A_local = T.alloc_shared((block_N,), dtype)
+            B_local = T.alloc_shared((block_N,), dtype)
+            C_local = T.alloc_fragment((block_N,), dtype)
 
-            # 计算起始索引和尾部大小
             start_idx = cid * block_N
             remaining = shape - start_idx
             tail_size = T.min(block_N, remaining)
 
-            # 从global memory拷贝到Unified Buffer
-            T.copy(A[start_idx : start_idx + tail_size], A_VEC[0:tail_size])
-            T.copy(B[start_idx : start_idx + tail_size], B_VEC[0:tail_size])
+            T.copy(A[start_idx : start_idx + tail_size], A_local[0:tail_size])
+            T.copy(B[start_idx : start_idx + tail_size], B_local[0:tail_size])
 
-            # NPU专用加法操作
-            T.npuir_add(A_VEC, B_VEC, C_VEC)
+            for i in T.Parallel(block_N):
+                C_local[i] = A_local[i] + B_local[i]
 
-            # 从Unified Buffer拷贝回global memory
-            T.copy(C_VEC[0:tail_size], C[start_idx : start_idx + tail_size])
+            T.copy(C_local[0:tail_size], C[start_idx : start_idx + tail_size])
 
     return main
 
@@ -74,9 +69,9 @@ def vector_add_simple(
     dtype: str = "float16",
 ):
     """
-    简化版NPU Vector Add
+    简化版 NPU Vector Add
 
-    不处理尾部元素，要求N是block_N的整数倍
+    不处理尾部元素，要求 N 是 block_N 的整数倍
     """
     n_num = N // block_N
 
@@ -87,16 +82,19 @@ def vector_add_simple(
         C: T.Tensor((N,), dtype),
     ):
         with T.Kernel(n_num, is_npu=True) as (cid, _):
-            A_VEC = T.alloc_ub((block_N,), dtype)
-            B_VEC = T.alloc_ub((block_N,), dtype)
-            C_VEC = T.alloc_ub((block_N,), dtype)
+            A_local = T.alloc_shared((block_N,), dtype)
+            B_local = T.alloc_shared((block_N,), dtype)
+            C_local = T.alloc_fragment((block_N,), dtype)
 
             start_idx = cid * block_N
 
-            T.copy(A[start_idx : start_idx + block_N], A_VEC)
-            T.copy(B[start_idx : start_idx + block_N], B_VEC)
-            T.npuir_add(A_VEC, B_VEC, C_VEC)
-            T.copy(C_VEC, C[start_idx : start_idx + block_N])
+            T.copy(A[start_idx : start_idx + block_N], A_local)
+            T.copy(B[start_idx : start_idx + block_N], B_local)
+
+            for i in T.Parallel(block_N):
+                C_local[i] = A_local[i] + B_local[i]
+
+            T.copy(C_local, C[start_idx : start_idx + block_N])
 
     return main
 
@@ -110,40 +108,30 @@ def vector_add_2d(
     dtype: str = "float16",
 ):
     """
-    2D Tensor加法的NPU实现
+    2D Tensor 加法的 NPU 实现
 
-    计算: C = A + B，其中A, B, C的shape都是(M, N)
+    计算: C = A + B，其中 A, B, C 的 shape 都是 (M, N)
     """
-    total_blocks = (M // block_M) * (N // block_N)
-
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(total_blocks, is_npu=True) as (cid, _):
-            num_blocks_n = N // block_N
-            by = cid // num_blocks_n
-            bx = cid % num_blocks_n
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), is_npu=True) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_N), dtype)
+            B_shared = T.alloc_shared((block_M, block_N), dtype)
+            C_local = T.alloc_fragment((block_M, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), dtype)
 
-            # 分配Unified Buffer
-            A_TILE = T.alloc_ub((block_M, block_N), dtype)
-            B_TILE = T.alloc_ub((block_M, block_N), dtype)
-            C_TILE = T.alloc_ub((block_M, block_N), dtype)
+            T.copy(A[by * block_M, bx * block_N], A_shared)
+            T.copy(B[by * block_M, bx * block_N], B_shared)
 
-            start_row = by * block_M
-            start_col = bx * block_N
+            for local_y, local_x in T.Parallel(block_M, block_N):
+                C_local[local_y, local_x] = A_shared[local_y, local_x] + B_shared[local_y, local_x]
 
-            # 拷贝数据到UB
-            T.copy(A[start_row : start_row + block_M, start_col : start_col + block_N], A_TILE)
-            T.copy(B[start_row : start_row + block_M, start_col : start_col + block_N], B_TILE)
-
-            # 执行加法
-            T.npuir_add(A_TILE, B_TILE, C_TILE)
-
-            # 写回结果到global memory
-            T.copy(C_TILE, C[start_row : start_row + block_M, start_col : start_col + block_N])
+            T.copy(C_local, C_shared)
+            T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return main
 

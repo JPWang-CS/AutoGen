@@ -57,8 +57,8 @@ def your_op_name(
             bx = cid % T.ceildiv(N, block_N)
 
             # 分配Unified Buffer用于存储tile数据 (NPU专用)
-            A_ub = T.alloc_ub((block_M, block_K), dtype)
-            B_ub = T.alloc_ub((block_K, block_N), dtype)
+            A_ub = T.alloc_shared((block_M, block_K), dtype)
+            B_ub = T.alloc_shared((block_K, block_N), dtype)
 
             # 分配fragment用于累加结果
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)

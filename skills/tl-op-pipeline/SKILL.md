@@ -74,11 +74,9 @@ def my_kernel(M, N, K, block_M, block_N, block_K, dtype=T.float16):
 
 ### 内存层次 (NPU专用)
 
-TileLang-Ascend 使用以下NPU内存分配原语：
+TileLang-Ascend 使用以下内存分配原语（npuir后端自动映射到NPU硬件）：
 
-- `T.alloc_ub`: 分配Unified Buffer (UB)，NPU片上高速缓存
-- `T.alloc_L1`: 分配L1 buffer
-- `T.alloc_L0A`, `T.alloc_L0B`, `T.alloc_L0C`: 分配L0 buffer (用于Cube单元)
+- `T.alloc_shared`: 分配共享内存（npuir后端自动映射到Unified Buffer/UB）
 - `T.alloc_fragment`: 分配寄存器fragment
 
 ### 核心原语
@@ -92,7 +90,6 @@ TileLang-Ascend 使用以下NPU内存分配原语：
 - `T.reduce_max`, `T.reduce_sum`: 归约操作
 - `T.Parallel`: 并行循环
 - `T.Pipelined`: 流水线循环（支持Cube/Vector core流水线）
-- `T.npuir_add`, `T.npuir_mul`, `T.npuir_sub`: NPU专用算术操作
 
 ### Kernel启动 (NPU模式)
 
@@ -124,35 +121,30 @@ import tilelang
 import tilelang.language as T
 
 @tilelang.jit(out_idx=[-1], target="npuir")
-def vec_add(N, block_N, dtype="float32"):
+def vec_add(N, block_N, dtype="float16"):
     n_num = N // block_N
 
     @T.prim_func
     def main(
-        A: T.Tensor((N), dtype),
-        B: T.Tensor((N), dtype),
-        C: T.Tensor((N), dtype),
-        shape: T.int32,
+        A: T.Tensor((N,), dtype),
+        B: T.Tensor((N,), dtype),
+        C: T.Tensor((N,), dtype),
     ):
         with T.Kernel(n_num, is_npu=True) as (cid, _):
-            # 分配Unified Buffer
-            A_VEC = T.alloc_ub((block_N), dtype)
-            B_VEC = T.alloc_ub((block_N), dtype)
-            C_VEC = T.alloc_ub((block_N), dtype)
+            A_local = T.alloc_shared((block_N,), dtype)
+            B_local = T.alloc_shared((block_N,), dtype)
+            C_local = T.alloc_fragment((block_N,), dtype)
 
             start_idx = cid * block_N
-            remaining = shape - start_idx
-            tail_size = T.min(block_N, remaining)
 
-            # 拷贝数据到UB
-            T.copy(A[start_idx : start_idx + tail_size], A_VEC[0:tail_size])
-            T.copy(B[start_idx : start_idx + tail_size], B_VEC[0:tail_size])
+            T.copy(A[start_idx : start_idx + block_N], A_local)
+            T.copy(B[start_idx : start_idx + block_N], B_local)
 
-            # NPU专用加法
-            T.npuir_add(A_VEC, B_VEC, C_VEC)
+            # 逐元素加法 (使用T.Parallel循环)
+            for i in T.Parallel(block_N):
+                C_local[i] = A_local[i] + B_local[i]
 
-            # 拷贝结果回global memory
-            T.copy(C_VEC[0:tail_size], C[start_idx : start_idx + tail_size])
+            T.copy(C_local, C[start_idx : start_idx + block_N])
 
     return main
 ```
@@ -172,16 +164,16 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
             by = cid // T.ceildiv(N, block_N)
             bx = cid % T.ceildiv(N, block_N)
 
-            # 使用Unified Buffer (NPU专用)
-            A_ub = T.alloc_ub((block_M, block_K), dtype)
-            B_ub = T.alloc_ub((block_K, block_N), dtype)
+            # 使用alloc_shared（npuir后端自动映射到UB）
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
-                T.copy(A[by * block_M, k * block_K], A_ub)
-                T.copy(B[k * block_K, bx * block_N], B_ub)
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
                 # 使用initC参数初始化累加器
-                T.gemm(A_ub, B_ub, C_local, initC=(k == 0))
+                T.gemm(A_shared, B_shared, C_local, initC=(k == 0))
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 

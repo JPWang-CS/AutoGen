@@ -120,8 +120,8 @@ Cube 计算和 Vector 计算不能共享同一 Bank Group：
 # A_VEC 和 A_MAT 使用相同Bank会冲突
 
 # 正确做法：划分不同的Bank Group
-A_VEC = T.alloc_ub((block_N,), dtype, bank_group=0)  # Vector使用
-A_MAT = T.alloc_ub((block_M, block_K), dtype, bank_group=1)  # Cube使用
+A_VEC = T.alloc_shared((block_N,), dtype, bank_group=0)  # Vector使用
+A_MAT = T.alloc_shared((block_M, block_K), dtype, bank_group=1)  # Cube使用
 ```
 
 ### 5. 流水线约束
@@ -219,8 +219,8 @@ aligned_size = (size + 31) // 32 * 32
 
 ```python
 # 为Cube和Vector分配不同Bank Group
-cube_buffer = T.alloc_ub(shape, dtype, bank_group=0)
-vector_buffer = T.alloc_ub(shape, dtype, bank_group=1)
+cube_buffer = T.alloc_shared(shape, dtype, bank_group=0)
+vector_buffer = T.alloc_shared(shape, dtype, bank_group=1)
 ```
 
 ## 多 SOC 适配策略
