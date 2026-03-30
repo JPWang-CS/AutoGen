@@ -1,10 +1,11 @@
 """
-TileLang Vector Add 算子实现 (NPU)
+TileLang Vector Add 算子实现 (NPU专用)
 
 计算: C = A + B
 所有计算在NPU上执行，精度对比在CPU上进行。
 
 参考: tilelang/examples/elementwise/example_elementwise_add.py
+注意: NPU kernel 只支持单维度 block，需要用线性索引处理 2D 问题。
 """
 
 import tilelang
@@ -18,9 +19,10 @@ def vector_add(
     dtype: str = "float16",
 ):
     """
-    Vector Add 的 TileLang NPU 实现
+    1D Vector Add 的 TileLang NPU 实现
 
     计算: C = A + B
+    要求 N 是 block_N 的整数倍。
 
     参数:
         N: 向量长度
@@ -29,49 +31,6 @@ def vector_add(
 
     返回:
         编译后的kernel函数
-
-    注意:
-        NPU版本需要额外传入shape参数 (torch.tensor(N, dtype=torch.int32))
-    """
-    n_num = N // block_N
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((N,), dtype),
-        B: T.Tensor((N,), dtype),
-        C: T.Tensor((N,), dtype),
-        shape: T.int32,
-    ):
-        with T.Kernel(n_num, is_npu=True) as (cid, _):
-            A_local = T.alloc_shared((block_N,), dtype)
-            B_local = T.alloc_shared((block_N,), dtype)
-            C_local = T.alloc_fragment((block_N,), dtype)
-
-            start_idx = cid * block_N
-            remaining = shape - start_idx
-            tail_size = T.min(block_N, remaining)
-
-            T.copy(A[start_idx : start_idx + tail_size], A_local[0:tail_size])
-            T.copy(B[start_idx : start_idx + tail_size], B_local[0:tail_size])
-
-            for i in T.Parallel(block_N):
-                C_local[i] = A_local[i] + B_local[i]
-
-            T.copy(C_local[0:tail_size], C[start_idx : start_idx + tail_size])
-
-    return main
-
-
-@tilelang.jit(out_idx=[-1], target="npuir")
-def vector_add_simple(
-    N: int,
-    block_N: int = 256,
-    dtype: str = "float16",
-):
-    """
-    简化版 NPU Vector Add
-
-    不处理尾部元素，要求 N 是 block_N 的整数倍
     """
     n_num = N // block_N
 
@@ -81,22 +40,29 @@ def vector_add_simple(
         B: T.Tensor((N,), dtype),
         C: T.Tensor((N,), dtype),
     ):
-        with T.Kernel(n_num, is_npu=True) as (cid, _):
-            A_local = T.alloc_shared((block_N,), dtype)
-            B_local = T.alloc_shared((block_N,), dtype)
+        # NPU kernel: 只支持单维度
+        with T.Kernel(n_num, is_npu=True) as (cid,):
+            A_shared = T.alloc_shared((block_N,), dtype)
+            B_shared = T.alloc_shared((block_N,), dtype)
             C_local = T.alloc_fragment((block_N,), dtype)
+            C_shared = T.alloc_shared((block_N,), dtype)
 
             start_idx = cid * block_N
 
-            T.copy(A[start_idx : start_idx + block_N], A_local)
-            T.copy(B[start_idx : start_idx + block_N], B_local)
+            T.copy(A[start_idx : start_idx + block_N], A_shared)
+            T.copy(B[start_idx : start_idx + block_N], B_shared)
 
             for i in T.Parallel(block_N):
-                C_local[i] = A_local[i] + B_local[i]
+                C_local[i] = A_shared[i] + B_shared[i]
 
-            T.copy(C_local, C[start_idx : start_idx + block_N])
+            T.copy(C_local, C_shared)
+            T.copy(C_shared, C[start_idx : start_idx + block_N])
 
     return main
+
+
+# vector_add_simple 与 vector_add 相同（不处理尾部）
+vector_add_simple = vector_add
 
 
 @tilelang.jit(out_idx=[-1], target="npuir")
@@ -111,14 +77,26 @@ def vector_add_2d(
     2D Tensor 加法的 NPU 实现
 
     计算: C = A + B，其中 A, B, C 的 shape 都是 (M, N)
+    要求 M 是 block_M 的整数倍，N 是 block_N 的整数倍。
+
+    注意: NPU kernel 只支持单维度 block，因此使用线性索引。
     """
+    num_blocks_m = M // block_M
+    num_blocks_n = N // block_N
+    total_blocks = num_blocks_m * num_blocks_n
+
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), is_npu=True) as (bx, by):
+        # NPU kernel: 只支持单维度，使用线性索引
+        with T.Kernel(total_blocks, is_npu=True) as (cid,):
+            # 从线性索引计算 2D block 坐标
+            by = cid // num_blocks_n
+            bx = cid % num_blocks_n
+
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_M, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), dtype)
@@ -146,24 +124,30 @@ def main():
     # 测试参数
     N = 1024 * 1024  # 1M elements
 
-    # 编译kernel
+    # 编译 1D kernel
     kernel = vector_add(N, block_N=256, dtype="float16")
-    kernel_simple = vector_add_simple(N, block_N=256, dtype="float16")
 
     # 准备输入数据 (NPU)
     a = torch.randn(N, device="npu", dtype=torch.float16)
     b = torch.randn(N, device="npu", dtype=torch.float16)
 
-    # 调用kernel
-    c = kernel(a, b, torch.tensor(N, dtype=torch.int32))
-    c_simple = kernel_simple(a, b)
+    # 调用 kernel
+    c = kernel(a, b)
 
-    # 精度对比在CPU上进行
+    # 精度对比在 CPU 上进行
     ref_c = a.cpu() + b.cpu()
-
     torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(c_simple.cpu(), ref_c, rtol=1e-2, atol=1e-2)
-    print("Correctness check passed!")
+    print("1D Vector Add passed!")
+
+    # 2D 测试
+    M_2d, N_2d = 128, 128
+    kernel_2d = vector_add_2d(M_2d, N_2d, block_M=16, block_N=16, dtype="float16")
+    a_2d = torch.randn(M_2d, N_2d, device="npu", dtype=torch.float16)
+    b_2d = torch.randn(M_2d, N_2d, device="npu", dtype=torch.float16)
+    c_2d = kernel_2d(a_2d, b_2d)
+    ref_c_2d = a_2d.cpu() + b_2d.cpu()
+    torch.testing.assert_close(c_2d.cpu(), ref_c_2d, rtol=1e-2, atol=1e-2)
+    print("2D Vector Add passed!")
 
     # 性能测试
     profiler = kernel.get_profiler()

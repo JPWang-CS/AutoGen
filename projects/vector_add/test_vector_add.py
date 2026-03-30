@@ -9,7 +9,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 
-from vector_add import vector_add, vector_add_simple, vector_add_2d
+from vector_add import vector_add, vector_add_2d
 
 
 # ============================================================================
@@ -50,7 +50,7 @@ class TestVectorAdd:
         a = torch.randn(N, device="npu", dtype=torch.float16)
         b = torch.randn(N, device="npu", dtype=torch.float16)
 
-        c = kernel(a, b, torch.tensor(N, dtype=torch.int32))
+        c = kernel(a, b)
 
         # 精度对比在CPU上进行
         ref_c = a.cpu() + b.cpu()
@@ -64,15 +64,15 @@ class TestVectorAdd:
         a = torch.randn(N, device="npu", dtype=torch.float32)
         b = torch.randn(N, device="npu", dtype=torch.float32)
 
-        c = kernel(a, b, torch.tensor(N, dtype=torch.int32))
+        c = kernel(a, b)
 
         ref_c = a.cpu() + b.cpu()
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-3, atol=1e-3)
 
     def test_simple_version(self):
-        """简化版本测试"""
+        """简化版本测试 (与标准版本相同)"""
         N = 1024
-        kernel = vector_add_simple(N, block_N=256, dtype="float16")
+        kernel = vector_add(N, block_N=256, dtype="float16")
 
         a = torch.randn(N, device="npu", dtype=torch.float16)
         b = torch.randn(N, device="npu", dtype=torch.float16)
@@ -98,7 +98,7 @@ class TestVectorAdd:
         a = torch.randn(N, device="npu", dtype=torch.float16)
         b = torch.randn(N, device="npu", dtype=torch.float16)
 
-        c = kernel(a, b, torch.tensor(N, dtype=torch.int32))
+        c = kernel(a, b)
 
         ref_c = a.cpu() + b.cpu()
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
@@ -112,7 +112,7 @@ class TestVectorAdd:
         a = torch.randn(N, device="npu", dtype=torch.float16)
         b = torch.randn(N, device="npu", dtype=torch.float16)
 
-        c = kernel(a, b, torch.tensor(N, dtype=torch.int32))
+        c = kernel(a, b)
 
         ref_c = a.cpu() + b.cpu()
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)

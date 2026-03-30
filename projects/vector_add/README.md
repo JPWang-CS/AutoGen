@@ -90,8 +90,8 @@ kernel = vector_add(N, block_N=256, dtype="float16")
 a = torch.randn(N, device="npu", dtype=torch.float16)
 b = torch.randn(N, device="npu", dtype=torch.float16)
 
-# 调用kernel (NPU版本需要传入shape参数)
-c = kernel(a, b, torch.tensor(N, dtype=torch.int32))
+# 调用kernel
+c = kernel(a, b)
 
 # 精度对比在CPU上进行
 ref_c = a.cpu() + b.cpu()
