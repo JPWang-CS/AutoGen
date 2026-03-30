@@ -35,7 +35,6 @@ def vector_add(N: int, block_N: int = 256, dtype: str = "float16"):
             A_shared = T.alloc_shared((block_N,), dtype)
             B_shared = T.alloc_shared((block_N,), dtype)
             C_local = T.alloc_fragment((block_N,), dtype)
-            C_shared = T.alloc_shared((block_N,), dtype)
 
             start_idx = cid * block_N
 
@@ -47,9 +46,8 @@ def vector_add(N: int, block_N: int = 256, dtype: str = "float16"):
             for i in T.Parallel(block_N):
                 C_local[i] = A_shared[i] + B_shared[i]
 
-            # 数据搬运: UB -> Global Memory
-            T.copy(C_local, C_shared)
-            T.copy(C_shared, C[start_idx : start_idx + block_N])
+            # 数据搬运: 直接从 local -> Global Memory
+            T.copy(C_local, C[start_idx : start_idx + block_N])
 
     return main
 
@@ -88,7 +86,6 @@ def vector_add_2d(M: int, N: int, block_M: int = 16, block_N: int = 16, dtype: s
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_M, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), dtype)
-            C_shared = T.alloc_shared((block_M, block_N), dtype)
 
             # 数据搬运
             T.copy(A[by * block_M, bx * block_N], A_shared)
@@ -98,9 +95,8 @@ def vector_add_2d(M: int, N: int, block_M: int = 16, block_N: int = 16, dtype: s
             for local_y, local_x in T.Parallel(block_M, block_N):
                 C_local[local_y, local_x] = A_shared[local_y, local_x] + B_shared[local_y, local_x]
 
-            # 数据搬运
-            T.copy(C_local, C_shared)
-            T.copy(C_shared, C[by * block_M, bx * block_N])
+            # 数据搬运: 直接从 local -> Global Memory
+            T.copy(C_local, C[by * block_M, bx * block_N])
 
     return main
 
