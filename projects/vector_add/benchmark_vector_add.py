@@ -1,46 +1,25 @@
 """
-TileLang-Ascend Vector Add 性能基准测试 (NPU专用)
+TileLang Vector Add 性能基准测试 (NPU专用)
 
-所有计算在NPU上执行，精度对比在CPU上进行。
+所有计算在NPU上执行。
 """
 
 import argparse
 import torch
-import tilelang
-import tilelang.language as T
 
-from vector_add import vector_add, vector_add_simple
+from vector_add import vector_add_2d
 
 
-def ref_program(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """PyTorch参考实现 (CPU上执行)"""
-    return A.cpu() + B.cpu()
-
-
-def calculate_bytes_moved(N: int, dtype_size: int = 2) -> int:
-    """
-    计算数据移动量（字节）
-
-    读2个向量 + 写1个向量 = 3 * N * sizeof(dtype)
-    """
-    return 3 * N * dtype_size
-
-
-def benchmark(N: int, block_N: int, warmup: int, rep: int, simple: bool = False):
+def run_benchmark(M, N, block_M, block_N, warmup, rep):
     """NPU性能测试"""
-    import torch_npu
     torch.npu.set_device(0)
 
-    if simple:
-        kernel = vector_add_simple(N, block_N=block_N, dtype="float16")
-    else:
-        kernel = vector_add(N, block_N=block_N, dtype="float16")
+    kernel = vector_add_2d(M, N, block_M=block_M, block_N=block_N, dtype="float16")
 
-    # 使用 (N, 1) shape 适配 NPU kernel
-    a = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
-    b = torch.randn(N, device="npu", dtype=torch.float16).unsqueeze(1)
+    a = torch.randn(M, N, device="npu", dtype=torch.float16)
+    b = torch.randn(M, N, device="npu", dtype=torch.float16)
 
-    # 正确性验证 (CPU对比)
+    # 正确性验证
     c = kernel(a, b)
     ref_c = a.cpu() + b.cpu()
     torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
@@ -48,41 +27,40 @@ def benchmark(N: int, block_N: int, warmup: int, rep: int, simple: bool = False)
 
     # 性能测试
     profiler = kernel.get_profiler()
-    tl_latency = profiler.do_bench(warmup=warmup, rep=rep)
+    latency = profiler.do_bench(warmup=warmup, rep=rep)
 
-    return tl_latency
+    return latency
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TileLang-Ascend Vector Add Benchmark (NPU)")
-    parser.add_argument("--N", type=int, default=1048576, help="Vector size (default: 1M)")
-    parser.add_argument("--block_N", type=int, default=256)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--rep", type=int, default=100)
-    parser.add_argument("--simple", action="store_true", help="Use simple version")
+    parser = argparse.ArgumentParser(description="TileLang Vector Add Benchmark (NPU)")
+    parser.add_argument("--m", type=int, default=4096, help="Matrix dimension M")
+    parser.add_argument("--n", type=int, default=4096, help="Matrix dimension N")
+    parser.add_argument("--block_m", type=int, default=32, help="Block size M")
+    parser.add_argument("--block_n", type=int, default=32, help="Block size N")
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
+    parser.add_argument("--rep", type=int, default=100, help="Repeat iterations")
     args = parser.parse_args()
 
-    N = args.N
-    print(f"Vector size: {N} ({N / 1024 / 1024:.2f}M elements)")
-    print(f"Device: NPU (华为昇腾)")
+    M, N = args.m, args.n
+    print(f"Problem size: M={M}, N={N}")
+    print(f"Device: NPU")
 
-    tl_latency = benchmark(N, args.block_N, args.warmup, args.rep, args.simple)
+    latency = run_benchmark(M, N, args.block_m, args.block_n, args.warmup, args.rep)
 
     # 计算性能指标
-    bytes_moved = calculate_bytes_moved(N)
-    tl_bandwidth = bytes_moved / tl_latency * 1e-6
+    bytes_moved = 3 * M * N * 2  # float16 = 2 bytes, 读2+写1
+    bandwidth_gbs = bytes_moved / latency * 1e-6
 
     # 打印结果
     print("\n" + "=" * 60)
-    print("TileLang-Ascend Vector Add Benchmark Results (NPU):")
+    print("TileLang Vector Add Benchmark Results (NPU):")
     print("=" * 60)
     print(f"Device:            NPU")
-    print(f"Vector size:       {N} ({N / 1024 / 1024:.2f}M)")
-    print(f"Block size:        {args.block_N}")
-    version = "simple" if args.simple else "standard"
-    print(f"Version:           {version}")
-    print(f"TileLang Latency:  {tl_latency:.3f} ms")
-    print(f"TileLang Bandwidth: {tl_bandwidth:.2f} GB/s")
+    print(f"Problem size:      M={M}, N={N}")
+    print(f"Block size:        {args.block_m} x {args.block_n}")
+    print(f"Latency:           {latency:.3f} ms")
+    print(f"Bandwidth:         {bandwidth_gbs:.2f} GB/s")
     print("=" * 60)
 
 

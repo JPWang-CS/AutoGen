@@ -4,11 +4,21 @@
 
 所有计算在NPU上执行，精度对比在CPU上进行。
 
+## NPU 编程规范
+
+本算子遵循 TileLang-Ascend NPU 编程规范：
+
+| 特性 | NPU 语法 |
+|------|---------|
+| Kernel 启动 | `T.Kernel(..., is_npu=True) as (cid, vid)` |
+| 内存分配 | `T.alloc_ub((shape), dtype)` |
+| 矩阵计算 | `T.gemm(A, B, C)` |
+| 核间同步 | `T.barrier_all()` |
+| 作用域 | `with T.Scope("V"):` |
+
 ## 功能特性
 
 - 基础GEMM实现 (`gemm`)
-- 使用Unified Buffer的GEMM (`gemm_with_ub`)
-- 支持B矩阵转置的GEMM (`gemm_transposed_b`)
 - 自动调优支持
 - 完整的单元测试
 
@@ -44,28 +54,6 @@ ref_c = a.cpu() @ b.cpu()
 torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 ```
 
-### 使用Unified Buffer
-
-```python
-from gemm import gemm_with_ub
-
-kernel = gemm_with_ub(M, N, K)
-c = kernel(a, b)
-```
-
-### 转置B矩阵
-
-```python
-from gemm import gemm_transposed_b
-
-# 计算 C = A @ B^T
-kernel = gemm_transposed_b(M, N, K)
-
-a = torch.randn(M, K, device="npu", dtype=torch.float16)
-b = torch.randn(N, K, device="npu", dtype=torch.float16)  # 注意shape
-c = kernel(a, b)
-```
-
 ## 运行测试
 
 ```bash
@@ -82,8 +70,8 @@ pytest test_gemm.py -v
 # 基础benchmark
 python gemm.py --M 4096 --N 4096 --K 4096
 
-# 自动调优
-python gemm.py --M 4096 --N 4096 --K 4096 --autotune
+# 自定义block size
+python gemm.py --M 4096 --N 4096 --K 4096 --block_M 64 --block_N 64 --block_K 32
 ```
 
 ## NPU 硬件约束
@@ -93,12 +81,12 @@ GEMM的tiling参数受NPU硬件约束限制：
 | 参数 | 约束 |
 |------|------|
 | UB 容量 | block_M * block_K * sizeof(dtype) <= UB容量 (~2MB) |
-| 分形对齐 | block_M, block_N, block_K 应为分形大小(16x16x16)的整数倍 |
+| 分形对齐 | block_M, block_N, block_K 应为16的整数倍 |
 | 数据对齐 | 32字节对齐 (cacheline) |
 
 推荐配置：
-- **910B**: block_M=128, block_N=128, block_K=32
-- **310P**: block_M=64, block_N=64, block_K=32
+- **910B**: block_M=32, block_N=32, block_K=32
+- **310P**: block_M=16, block_N=16, block_K=16
 
 ## 参考
 

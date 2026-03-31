@@ -11,6 +11,19 @@ TileLang-Ascend 实现的 your_op_name 算子，运行在华为昇腾NPU上。
 
 所有计算在 NPU 上执行，精度对比在 CPU 上进行。
 
+## NPU 编程规范
+
+本算子遵循 TileLang-Ascend NPU 编程规范：
+
+| 特性 | NPU 语法 |
+|------|---------|
+| Kernel 启动 | `T.Kernel(..., is_npu=True) as (cid, vid)` |
+| 内存分配 | `T.alloc_ub((shape), dtype)` |
+| 向量计算 | `T.tile.add/mul/...` |
+| 矩阵计算 | `T.gemm(A, B, C)` |
+| 核间同步 | `T.barrier_all()` |
+| 作用域 | `with T.Scope("V"):` |
+
 ## 接口说明
 
 ### 函数签名
@@ -21,12 +34,10 @@ def your_op_name(
     M: int,
     N: int,
     K: int,
-    block_M: int = 64,
-    block_N: int = 64,
+    block_M: int = 32,
+    block_N: int = 32,
     block_K: int = 32,
-    num_stages: int = 2,
     dtype: str = "float16",
-    accum_dtype: str = "float32",
 ):
     ...
 ```
@@ -38,12 +49,10 @@ def your_op_name(
 | M | int | - | 矩阵A的行数 |
 | N | int | - | 矩阵B的列数 |
 | K | int | - | 矩阵A的列数/矩阵B的行数 |
-| block_M | int | 64 | M维度的tiling大小 |
-| block_N | int | 64 | N维度的tiling大小 |
+| block_M | int | 32 | M维度的tiling大小 |
+| block_N | int | 32 | N维度的tiling大小 |
 | block_K | int | 32 | K维度的tiling大小 |
-| num_stages | int | 2 | 流水线深度 |
 | dtype | str | "float16" | 输入/输出数据类型 |
-| accum_dtype | str | "float32" | 累加数据类型 |
 
 ### 输入/输出
 
@@ -101,10 +110,7 @@ python test_your_op_name.py
 pytest test_your_op_name.py -v
 
 # 运行性能测试
-python benchmark_your_op_name.py --M 4096 --N 4096 --K 4096
-
-# 运行自动调优
-python benchmark_your_op_name.py --M 4096 --N 4096 --K 4096 --autotune
+python benchmark_your_op_name.py --m 4096 --n 4096 --k 4096
 ```
 
 ## NPU 硬件约束
@@ -113,13 +119,12 @@ Tiling 参数受 NPU 硬件约束限制：
 
 | 参数 | 约束 |
 |------|------|
-| UB 容量 | block_M * block_K * sizeof(dtype) <= UB容量 (~2MB) |
-| 分形对齐 | block_M, block_N, block_K 应为分形大小(16x16x16)的整数倍 |
+| UB 容量 | block_M * block_N * sizeof(dtype) <= UB容量 (~2MB) |
 | 数据对齐 | 32字节对齐 (cacheline) |
 
 推荐配置：
-- **910B**: block_M=128, block_N=128, block_K=32
-- **310P**: block_M=64, block_N=64, block_K=32
+- **910B**: block_M=32, block_N=32, block_K=32
+- **310P**: block_M=16, block_N=16, block_K=16
 
 ## 注意事项
 

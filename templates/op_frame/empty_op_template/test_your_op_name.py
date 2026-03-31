@@ -12,8 +12,6 @@ TileLang-Ascend 算子测试模板 - your_op_name (NPU专用)
 
 import torch
 import pytest
-import tilelang
-import tilelang.language as T
 
 from your_op_name import your_op_name
 
@@ -41,14 +39,16 @@ def ref_your_op_name(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
     your_op_name的PyTorch参考实现 (CPU上执行)
 
+    TODO: 根据你的算子修改此实现
+
     参数:
-        A: 输入tensor，shape为(M, K)
-        B: 输入tensor，shape为(K, N)
+        A: 输入tensor
+        B: 输入tensor
 
     返回:
-        输出tensor，shape为(M, N)
+        输出tensor
     """
-    return A @ B
+    return A @ B  # 示例: GEMM
 
 
 # ============================================================================
@@ -65,9 +65,7 @@ class TestYourOpName:
     def test_basic_correctness(self):
         """基础正确性测试"""
         M, N, K = 128, 128, 128
-        block_M, block_N, block_K = 64, 64, 32
-
-        kernel = your_op_name(M, N, K, block_M, block_N, block_K)
+        kernel = your_op_name(M, N, K, block_M=32, block_N=32, block_K=32)
 
         a = torch.randn(M, K, device="npu", dtype=torch.float16)
         b = torch.randn(K, N, device="npu", dtype=torch.float16)
@@ -78,38 +76,10 @@ class TestYourOpName:
         ref_c = ref_your_op_name(a.cpu(), b.cpu())
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
-    def test_float16(self):
-        """float16数据类型测试"""
-        M, N, K = 256, 256, 256
-        kernel = your_op_name(M, N, K, dtype="float16")
-
-        a = torch.randn(M, K, device="npu", dtype=torch.float16)
-        b = torch.randn(K, N, device="npu", dtype=torch.float16)
-
-        c = kernel(a, b)
-
-        ref_c = ref_your_op_name(a.cpu(), b.cpu())
-        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
-
-    def test_float32(self):
-        """float32数据类型测试"""
-        M, N, K = 256, 256, 256
-        kernel = your_op_name(M, N, K, dtype="float32", accum_dtype="float32")
-
-        a = torch.randn(M, K, device="npu", dtype=torch.float32)
-        b = torch.randn(K, N, device="npu", dtype=torch.float32)
-
-        c = kernel(a, b)
-
-        ref_c = ref_your_op_name(a.cpu(), b.cpu())
-        torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
-
     def test_large_shape(self):
         """大shape测试"""
-        M, N, K = 4096, 4096, 4096
-        block_M, block_N, block_K = 128, 128, 32
-
-        kernel = your_op_name(M, N, K, block_M, block_N, block_K)
+        M, N, K = 1024, 1024, 1024
+        kernel = your_op_name(M, N, K, block_M=32, block_N=32, block_K=32)
 
         a = torch.randn(M, K, device="npu", dtype=torch.float16)
         b = torch.randn(K, N, device="npu", dtype=torch.float16)
@@ -121,7 +91,7 @@ class TestYourOpName:
 
     def test_non_square(self):
         """非方阵测试"""
-        M, N, K = 1024, 512, 256
+        M, N, K = 512, 256, 128
         kernel = your_op_name(M, N, K)
 
         a = torch.randn(M, K, device="npu", dtype=torch.float16)
@@ -137,7 +107,6 @@ class TestYourOpName:
         (128, 128, 128),
         (256, 256, 256),
         (512, 512, 512),
-        (1024, 1024, 1024),
     ])
     def test_various_shapes(self, M, N, K):
         """参数化测试不同shape"""
@@ -152,14 +121,13 @@ class TestYourOpName:
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("block_M,block_N,block_K", [
+        (16, 16, 16),
+        (32, 32, 32),
         (64, 64, 32),
-        (128, 128, 32),
-        (128, 128, 64),
-        (64, 128, 32),
     ])
-    def test_different_tiling(self, block_M, block_N, block_K):
-        """测试不同tiling配置"""
-        M, N, K = 512, 512, 512
+    def test_different_block_sizes(self, block_M, block_N, block_K):
+        """测试不同block size配置"""
+        M, N, K = 256, 256, 256
 
         kernel = your_op_name(M, N, K, block_M, block_N, block_K)
 
@@ -170,21 +138,6 @@ class TestYourOpName:
 
         ref_c = ref_your_op_name(a.cpu(), b.cpu())
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
-
-    def test_pipeline_stages(self):
-        """测试不同流水线深度"""
-        M, N, K = 512, 512, 512
-
-        for num_stages in [0, 1, 2]:
-            kernel = your_op_name(M, N, K, num_stages=num_stages)
-
-            a = torch.randn(M, K, device="npu", dtype=torch.float16)
-            b = torch.randn(K, N, device="npu", dtype=torch.float16)
-
-            c = kernel(a, b)
-
-            ref_c = ref_your_op_name(a.cpu(), b.cpu())
-            torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

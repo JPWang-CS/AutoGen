@@ -15,7 +15,7 @@ TileLang-Ascend算子仅支持NPU设备：
 所有计算在NPU上执行，精度对比在CPU上进行。
 
 ## 工作流
-1. 确认需要生成的算子类型（例如：GEMM、FlashAttention、DequantizeGEMM、VectorAdd等）。
+1. 确认需要生成的算子类型（例如：GEMM、FlashAttention、VectorAdd等）。
 2. 确认目标子项目路径（例如 `projects/gemm/...` 或 `projects/attention/...`）。
 3. 仅在触发本技能时才生成 `claude.local.md`。
 4. 若 `claude.local.md` 不存在，则创建并写入"新增算子输入模板"。
@@ -36,74 +36,91 @@ TileLang-Ascend算子仅支持NPU设备：
   - `benchmark_your_op_name.py` - 性能基准测试文件
   - `README.md` - 算子说明文档
 
-## TileLang-Ascend核心概念
+## ⚠️ NPU 编程规范 (重要)
 
-### 两种编译后端
+### CUDA vs NPU 对比
 
-TileLang-Ascend 支持两种编译后端（通过环境变量或自动检测）：
-1. **AscendNPU IR** - 推荐用于大多数场景，Developer Mode（默认）
-2. **Ascend C & PTO** - 用于底层优化，Expert Mode
+| 特性 | CUDA (错误) | NPU (正确) |
+|------|------------|-----------|
+| **Kernel启动** | `T.Kernel(..., threads=N)` | `T.Kernel(..., is_npu=True) as (cid, vid)` |
+| **Block索引** | `(bx, by)` 直接2D | `(cid, vid)` 线性索引，手动计算 |
+| **内存分配** | `T.alloc_shared`, `T.alloc_fragment` | `T.alloc_ub` (Unified Buffer) |
+| **并行循环** | `T.Parallel(M, N)` | `T.serial` 或向量指令 |
+| **向量计算** | 标量 `a + b` | `T.tile.add(c, a, b)` |
+| **矩阵计算** | 手动循环 | `T.gemm(A, B, C)` |
+| **同步** | 自动 | `T.barrier_all()` |
+| **作用域** | 无 | `with T.Scope("V"):` |
 
-### 开发模式
-
-- **Developer Mode (默认)**: `TILELANG_ASCEND_MODE=developer` 或不设置
-- **Expert Mode**: `TILELANG_ASCEND_MODE=expert`
-
-### 基本结构
-
-TileLang-Ascend使用Python装饰器 `@tilelang.jit` 来定义可JIT编译的kernel：
+### NPU Kernel 基本结构
 
 ```python
-import tilelang
-import tilelang.language as T
+@tilelang.jit(out_idx=[-1])
+def my_kernel(M, N, block_M, block_N, dtype="float16"):
+    m_num = M // block_M
+    n_num = N // block_N
+    VEC_NUM = 2  # 向量化因子
 
-@tilelang.jit(out_idx=[-1])  # target指定为npuir
-def my_kernel(M, N, K, block_M, block_N, block_K, dtype=T.float16):
     @T.prim_func
     def main(
-        A: T.Tensor((M, K), dtype),
-        B: T.Tensor((K, N), dtype),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        # kernel实现
-        with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (cid, _):
-            # 使用is_npu=True标识NPU kernel
-            pass
+        # NPU kernel: 使用线性索引，is_npu=True
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
+            # 计算当前block的2D坐标
+            bx = cid // n_num
+            by = cid % n_num
+
+            # NPU内存分配: 使用 alloc_ub 分配 Unified Buffer
+            a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+
+            # Vector Core 作用域
+            with T.Scope("V"):
+                # 数据搬运: GM -> UB
+                T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
+                T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
+
+                # 核间同步
+                T.barrier_all()
+
+                # 计算: 使用向量指令
+                T.tile.add(c_ub, a_ub, b_ub)
+
+                # 核间同步
+                T.barrier_all()
+
+                # 数据搬运: UB -> GM
+                T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
+
     return main
 ```
 
-### 内存层次 (NPU专用)
+### NPU 向量指令
 
-TileLang-Ascend 使用以下内存分配原语（npuir后端自动映射到NPU硬件）：
+| 指令 | 说明 |
+|------|------|
+| `T.tile.add(C, A, B)` | 向量加法 C = A + B |
+| `T.tile.mul(C, A, B)` | 向量乘法 C = A * B |
+| `T.tile.sub(C, A, B)` | 向量减法 C = A - B |
+| `T.tile.div(C, A, B)` | 向量除法 C = A / B |
+| `T.gemm(A, B, C)` | 矩阵乘法 C += A @ B |
 
-- `T.alloc_shared`: 分配共享内存（npuir后端自动映射到Unified Buffer/UB）
-- `T.alloc_fragment`: 分配寄存器fragment
+### 内存层次 (NPU)
 
-### 核心原语
+| 函数 | 说明 |
+|------|------|
+| `T.alloc_ub(shape, dtype)` | 分配 Unified Buffer |
+| `T.fill(buffer, value)` | 填充buffer |
 
-- `T.copy`: 数据拷贝
-- `T.gemm`: 矩阵乘法 (NPU Developer Mode)
-- `T.gemm_v0`: NPU专用矩阵乘法，支持init参数
-- `T.mma`: NPU矩阵乘累加
-- `T.clear`: 清空buffer
-- `T.fill`: 填充buffer
-- `T.reduce_max`, `T.reduce_sum`: 归约操作
-- `T.Parallel`: 并行循环
-- `T.Pipelined`: 流水线循环（支持Cube/Vector core流水线）
+### 同步原语
 
-### Kernel启动 (NPU模式)
-
-```python
-# NPU kernel启动模式
-with T.Kernel(n_num, is_npu=True) as (cid, _):
-    # cid 是核的索引
-    # 第二个参数为保留参数，通常用_表示
-
-# 对于2D分块，使用线性索引计算
-with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (cid, _):
-    by = cid // T.ceildiv(N, block_N)
-    bx = cid % T.ceildiv(N, block_N)
-```
+| 函数 | 说明 |
+|------|------|
+| `T.barrier_all()` | 所有核同步 |
+| `T.barrier(tid)` | 指定核同步 |
 
 ### 数据类型
 
@@ -117,107 +134,80 @@ dtype参数使用字符串类型：
 ### Vector Add (NPU版本)
 
 ```python
-import tilelang
-import tilelang.language as T
-
 @tilelang.jit(out_idx=[-1])
-def vec_add(N, block_N, dtype="float16"):
+def vector_add_2d(M, N, block_M, block_N, dtype="float16"):
+    m_num = M // block_M
     n_num = N // block_N
+    VEC_NUM = 2
 
     @T.prim_func
     def main(
-        A: T.Tensor((N,), dtype),
-        B: T.Tensor((N,), dtype),
-        C: T.Tensor((N,), dtype),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(n_num, is_npu=True) as (cid, _):
-            A_local = T.alloc_shared((block_N,), dtype)
-            B_local = T.alloc_shared((block_N,), dtype)
-            C_local = T.alloc_fragment((block_N,), dtype)
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
+            bx = cid // n_num
+            by = cid % n_num
 
-            start_idx = cid * block_N
+            a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
 
-            T.copy(A[start_idx : start_idx + block_N], A_local)
-            T.copy(B[start_idx : start_idx + block_N], B_local)
+            with T.Scope("V"):
+                T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
+                T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
 
-            # 逐元素加法 (使用T.Parallel循环)
-            for i in T.Parallel(block_N):
-                C_local[i] = A_local[i] + B_local[i]
+                T.barrier_all()
+                T.tile.add(c_ub, a_ub, b_ub)
+                T.barrier_all()
 
-            T.copy(C_local, C[start_idx : start_idx + block_N])
+                T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
     return main
 ```
 
-### GEMM (NPU Developer Mode)
+### GEMM (NPU版本)
 
 ```python
 @tilelang.jit(out_idx=[-1])
-def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
+def gemm(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
+    m_num = M // block_M
+    n_num = N // block_N
+    VEC_NUM = 2
+
     @T.prim_func
-    def gemm(
+    def main(
         A: T.Tensor((M, K), dtype),
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (cid, _):
-            by = cid // T.ceildiv(N, block_N)
-            bx = cid % T.ceildiv(N, block_N)
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
+            bx = cid // n_num
+            by = cid % n_num
 
-            # 使用alloc_shared（npuir后端自动映射到UB）
-            A_shared = T.alloc_shared((block_M, block_K), dtype)
-            B_shared = T.alloc_shared((block_K, block_N), dtype)
-            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            a_ub = T.alloc_ub((block_M // VEC_NUM, block_K), dtype)
+            b_ub = T.alloc_ub((block_K, block_N), dtype)
+            c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), accum_dtype)
 
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                # 使用initC参数初始化累加器
-                T.gemm(A_shared, B_shared, C_local, initC=(k == 0))
+            T.fill(c_ub, 0)
 
-            T.copy(C_local, C[by * block_M, bx * block_N])
+            for k in T.serial(K // block_K):
+                with T.Scope("V"):
+                    T.copy(A[bx * block_M + vid * block_M // VEC_NUM, k * block_K], a_ub)
+                    T.copy(B[k * block_K, by * block_N], b_ub)
 
-    return gemm
+                    T.barrier_all()
+                    T.gemm(a_ub, b_ub, c_ub)
+                    T.barrier_all()
+
+            with T.Scope("V"):
+                T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
+
+    return main
 ```
 
-## 性能优化选项
-
-### 流水线
-使用 `T.Pipelined` 实现Cube/Vector core流水线，`num_stages` 控制流水线深度：
-
-```python
-for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
-    # 加载和计算可以重叠
-```
-
-### 自动同步
-启用自动同步功能：
-
-```python
-import tilelang
-pass_configs = {tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True}
-compiled_kernel = tilelang.compile(func, pass_configs=pass_configs)
-```
-
-### 手动同步
-NPU专用同步原语：
-- `T.barrier_all()`: 全核同步
-- `T.set_flag`: 设置同步标志
-- `T.wait_flag`: 等待同步标志
-
-### 自动调优
-使用 `@autotune` 装饰器自动搜索最优配置：
-
-```python
-from tilelang.autotuner import *
-
-@autotune(configs=get_configs(), warmup=10, rep=10)
-@tilelang.jit(out_idx=[-1])
-def my_kernel(...):
-    ...
-```
-
-## 设备检测
+## 设备检测与使用
 
 生成的代码使用NPU专用初始化：
 
@@ -227,49 +217,17 @@ import torch_npu
 
 # 设置NPU设备
 torch.npu.set_device(0)
-```
-
-## NPU使用说明
-
-### 安装依赖
-
-```bash
-pip install torch-npu
-pip install git+https://github.com/tile-ai/tilelang-ascend
-```
-
-### 编译和运行
-
-```python
-import torch
-import torch_npu
-import tilelang
-
-# 设置NPU设备
-torch.npu.set_device(0)
-
-# 编译kernel
-compiled_kernel = tilelang.compile(func)
 
 # 准备数据 (NPU)
-a = torch.randn(M, K, device="npu", dtype=torch.float16)
-b = torch.randn(K, N, device="npu", dtype=torch.float16)
+a = torch.randn(M, N, device="npu", dtype=torch.float16)
+b = torch.randn(M, N, device="npu", dtype=torch.float16)
 
 # 调用kernel
-c = compiled_kernel(a, b)
+c = kernel(a, b)
 
 # 精度对比在CPU上进行
-ref_c = a.cpu() @ b.cpu()
+ref_c = a.cpu() + b.cpu()
 torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
-```
-
-### 数据准备
-
-```python
-# NPU tensor创建
-torch.npu.set_device(0)
-a = torch.randn(M, K, device="npu", dtype=torch.float16)
-b = torch.randn(K, N, device="npu", dtype=torch.float16)
 ```
 
 ## NPU 硬件约束
@@ -280,25 +238,20 @@ b = torch.randn(K, N, device="npu", dtype=torch.float16)
 
 | SOC 版本 | 代号 | 定位 | 推荐配置 |
 |---------|------|------|---------|
-| **Ascend 910B** | DAV_3510 | 训练（主流） | block_M=128, block_N=128, block_K=64 |
-| **Ascend 910A** | DAV_2201 | 训练 | block_M=64, block_N=128, block_K=64 |
-| **Ascend 310P** | DAV_310P | 推理 | block_M=64, block_N=64, block_K=32 |
+| **Ascend 910B** | DAV_3510 | 训练（主流） | block_M=32, block_N=32, block_K=32 |
+| **Ascend 910A** | DAV_2201 | 训练 | block_M=32, block_N=32, block_K=32 |
+| **Ascend 310P** | DAV_310P | 推理 | block_M=16, block_N=16, block_K=16 |
 
 ### 关键硬件限制
 1. **UB 容量限制**: Tile 分块大小不能超过 UB 容量（约 1-2MB）
-2. **L1/L0 Buffer 限制**: 矩阵分块需满足分形大小对齐（512B 对齐）
-3. **数据对齐要求**:
-   - GM → UB: 32 字节对齐（cacheline）
-   - L1 → L0A/L0B: 512 字节对齐（分形大小）
-4. **Cube/Vector 资源**: 避免同一 Bank Group 冲突
-5. **流水线深度**: 根据 Buffer 占用合理设置 `num_stages`
+2. **数据对齐要求**: 32字节对齐（cacheline）
+3. **向量化因子**: 通常 VEC_NUM=2
 
 ### 硬件约束检查清单
 在生成算子时，必须验证：
 - [ ] Tile 大小是否在 UB 容量限制内
 - [ ] 分块大小是否满足对齐要求
-- [ ] Cube/Vector 操作是否使用不同 Bank Group
-- [ ] 流水线深度是否合理
+- [ ] 是否使用了正确的 NPU 语法 (alloc_ub, T.tile.*, barrier_all)
 
 ## 约束
 - 默认最小改动，且不引入新依赖。
@@ -306,15 +259,9 @@ b = torch.randn(K, N, device="npu", dtype=torch.float16)
 - 若输入信息不足，必须先列出假设。
 - 严格按照输入文档/模板中列出的参数生成代码，不得自行添加或删减任何参数。
 - 生成的代码需要遵循TileLang-Ascend的编程规范和最佳实践。
-- 默认使用 `is_npu=True` 标识NPU kernel，target由环境自动检测。
+- **必须使用 NPU 专用语法**: `is_npu=True`, `alloc_ub`, `T.tile.*`, `barrier_all`, `T.Scope("V")`
+- **禁止使用 CUDA 语法**: `T.Parallel`, `alloc_shared`, `alloc_fragment`, `threads` 参数
 - **生成的代码必须符合目标SOC的硬件上限**，参见 `skills/tl-op-hardware-constraints/Skill.md`。
-
-- **算子搬运和计算必须符合不同NPU（如910B等）的硬件限制**：
-  - UB容量限制： Tile大小不能超过UB容量
-  - L1/L0 Buffer限制: 需满足分形大小对齐要求
-  - 数据对齐: 32字节对齐（cacheline）/ 512字节对齐（分形）
-  - Cube/Vector资源: 避免同一Bank Group冲突
-  - 流水线深度: 根据Buffer占用合理设置num_stages
 
 ## 参考
 - 模板目录：`templates/op_frame/empty_op_template`
@@ -322,5 +269,3 @@ b = torch.randn(K, N, device="npu", dtype=torch.float16)
 - **硬件约束参考**: `skills/tl-op-hardware-constraints/Skill.md`
 - TileLang-Ascend GitHub：`https://github.com/tile-ai/tilelang-ascend`
 - TileLang-Ascend 开发指南：`https://github.com/tile-ai/tilelang-ascend/blob/npuir/docs/开发指南.md`
-- TileLang官方示例：`https://github.com/tile-ai/tilelang/tree/main/examples`
-- TileLang文档：`https://tilelang.com/`
