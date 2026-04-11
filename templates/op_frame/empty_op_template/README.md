@@ -4,16 +4,11 @@ TileLang-Ascend 实现的 your_op_name 算子，运行在华为昇腾NPU上。
 
 ## 算子描述
 
-请在此处添加算子的详细描述，包括：
-- 算子的数学定义
-- 算子的应用场景
-- 算子的输入输出规格
+请在此处添加算子的详细描述。
 
 所有计算在 NPU 上执行，精度对比在 CPU 上进行。
 
 ## NPU 编程规范
-
-本算子遵循 TileLang-Ascend NPU 编程规范：
 
 | 特性 | NPU 语法 |
 |------|---------|
@@ -58,10 +53,12 @@ def your_op_name(
 
 **输入:**
 - `A`: Tensor of shape (M, K), dtype
-- `B`: Tensor of shape (K, N), dtype
+- `B`: Tensor of shape (K, N)
+ dtype
 
 **输出:**
-- `C`: Tensor of shape (M, N), dtype
+- `C`: Tensor of shape (M, N)
+ dtype
 
 ## 使用示例
 
@@ -115,26 +112,13 @@ python benchmark_your_op_name.py --m 4096 --n 4096 --k 4096
 
 ## NPU 硬件约束
 
-Tiling 参数受 NPU 硬件约束限制：
-
 | 参数 | 约束 |
 |------|------|
 | UB 容量 | block_M * block_N * sizeof(dtype) <= UB容量 (~2MB) |
 | 数据对齐 | 32字节对齐 (cacheline) |
-
-推荐配置：
-- **910B**: block_M=32, block_N=32, block_K=32
-- **310P**: block_M=16, block_N=16, block_K=16
-
-## 注意事项
-
-1. 确保输入数据在 NPU 设备上
-2. 数据类型需要与kernel定义的dtype一致
-3. 问题规模需要能被block size整除以获得最佳性能
-4. 精度对比始终在CPU上进行
+| VEC_NUM | 2 (每个block由2个vector core并行处理) |
 
 ## 参考
 
 - [TileLang-Ascend GitHub](https://github.com/tile-ai/tilelang-ascend)
 - [TileLang Documentation](https://tilelang.com/)
-- [TileLang-Ascend 开发指南](https://github.com/tile-ai/tilelang-ascend/blob/npuir/docs/开发指南.md)
