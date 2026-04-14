@@ -33,26 +33,30 @@ description: 修改现有TileLang算子时，生成 claude.local.md 输入模板
 ### 1. 修改数据类型
 ```python
 # 修改前
-dtype = T.float16
+dtype = "float16"
 
 # 修改后
-dtype = T.bfloat16  # 或 T.float32
+dtype = "bfloat16"  # 或 "float32"
 ```
 
 ### 2. 调整tiling参数
 ```python
 # 修改block size
-def my_kernel(M, N, K, block_M=128, block_N=128, block_K=32):
-    # 原来是 block_M=64, block_N=64, block_K=64
+def my_kernel(M, N, K, block_M=128, block_N=128, K_L1=32):
+    # 原来是 block_M=64, block_N=64, K_L1=64
 ```
 
-### 3. 修改流水线深度
+### 3. 修改流水线
 ```python
-# 修改前
-for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
+# Expert模式: 修改同步方式
+T.barrier_all()
+# 或使用细粒度流水线: T.set_flag / T.wait_flag
 
-# 修改后
-for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+# Developer模式: 调整pass_configs
+pass_configs = {
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
+    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
+}
 ```
 
 ### 4. 添加新的输入tensor

@@ -1,274 +1,360 @@
 # TileLang-Ascend AutoGen 仓库 (NPU专用)
 
-本仓库提供TileLang-Ascend NPU算子自动生成的skill提示词和相关模板。所有算子运行在华为昇腾NPU上，精度对比在CPU上进行。
+本仓库提供TileLang-Ascend NPU算子自动生成的skill提示词和相关模板。所有算子运行在华为昇腾NPU上。
 
-## ⚠️ NPU 编程规范 (重要)
+## ⚠️ 权威参考源
 
-### NPU 执行引擎架构
+- **tilelang-ascend 仓库**: `M:\Desktop\tmp\AgentTest\TileLang\tilelang-ascend` — 正确的 NPU API
+- **tilelang-ascend 示例**: `tilelang-ascend/examples/` — 可运行的参考代码
+- **tilelang-ascend Skills**: `tilelang-ascend/.agents/skills/` — API最佳实践和编程指南
+- **⚠️ 旧仓库仅参考**: `M:\Desktop\tmp\AgentTest\TileLang\tilelang` 是上游 GPU TileLang，API与 NPU 版本差异很大，**禁止直接使用其语法**
 
-| 引擎 | 名称 | 功能 | 能否操作 UB |
-|------|------|------|------------|
-| **MTE2** | Memory Transfer Engine 2 | GM -> UB 数据加载 | ❌ 只搬运，不计算 |
-| **V** | Vector Core | 向量计算 | ✅ **只有 V 核才能操作 UB 进行计算** |
-| **MTE3** | Memory Transfer Engine 3 | UB -> GM 数据存储 | ❌ 只搬运，不计算 |
-| **Cube** | Cube Core | 矩阵乘法 | ❌ **Cube 核没有 UB！** |
+## ⚠️ NPU 两种编程模式
 
-### ⚠️ 关键约束
+| 特性 | Expert 模式 | Developer 模式 |
+|------|------------|---------------|
+| Cube内存 | `T.alloc_L1()`, `T.alloc_L0C()` | `T.alloc_shared()`, `T.alloc_fragment()` |
+| Vector内存 | `T.alloc_ub()` | `T.alloc_shared()` |
+| GEMM | `T.gemm_v0(A_L1, B_L1, C_L0C, init=...)` | 同左 |
+| 向量计算 | `T.tile.add(c, a, b)` | `T.Parallel` + 标量运算 |
+| 同步 | 手动 `T.barrier_all()`, `T.set_flag/wait_flag` | pass_configs 自动 |
+| 作用域 | `T.Scope("C")` / `T.Scope("V")` | 无需 |
+| pass_configs | 不使用或全False | 开启AUTO_SYNC, MEMORY_PLANNING等 |
 
-1. **只有 Vector Core (V) 才能操作 UB 进行计算**
-   - `T.tile.add`, `T.tile.mul` 等向量指令**必须在** `T.Scope("V")` 内
-   - Cube 核用于矩阵乘法 (`T.gemm`)，**没有 UB**
+## ⚠️ NPU 执行引擎架构
 
-2. **数据搬运必须在对应的作用域内执行**
-   - `T.copy(A[...], a_ub)`: GM -> UB，**必须在** `T.Scope("V")` 内
-   - `T.copy(c_ub, C[...])`: UB -> GM，**必须在** `T.Scope("V")` 内
-   - 搬运到 Cube 的 L2/L0 需要在 Cube 作用域内
+### 内存层级 (不可跨级访问)
 
-3. **流水线同步确保引擎间正确协作**
-   - `T.set_flag("mte2", "v", 0)`: MTE2 完成，通知 V
-   - `T.wait_flag("mte2", "v", 0)`: V 等待 MTE2
-   - `T.set_flag("v", "mte3", 0)`: V 完成，通知 MTE3
-   - `T.wait_flag("v", "mte3", 0)`: MTE3 等待 V
+```
+GM（全局内存）
+  ↕ T.copy
+L1（Cube 核缓存）/ UB（Vector 核缓冲）
+  ↕ T.copy
+L0A / L0B（矩阵输入寄存器）→ L0C（矩阵输出寄存器）
+```
 
-### CUDA vs NPU 关键差异
+| 引擎 | 功能 | 操作范围 |
+|------|------|---------|
+| **MTE2** | GM → L1/UB 数据加载 | T.Scope("C")或T.Scope("V") 内 |
+| **Cube** | 矩阵乘法 `T.gemm_v0`/`T.mma` | T.Scope("C") 内 |
+| **V (Vector)** | 向量计算 `T.tile.*` | T.Scope("V") 内 |
+| **MTE3** | L1/UB → GM 数据存储 | T.Scope("C")或T.Scope("V") 内 |
 
-| 特性 | ❌ CUDA (禁用) | ✅ NPU (正确) |
-|------|---------------|-------------|
-| **Kernel启动** | `T.Kernel(..., threads=N)` | `T.Kernel(..., is_npu=True) as (cid, vid)` |
-| **Block索引** | `(bx, by)` 直接2D | `(cid, vid)` 线性索引，手动计算 |
-| **内存分配** | `alloc_shared`, `alloc_fragment` | `alloc_ub` (Unified Buffer) |
-| **并行循环** | `T.Parallel(M, N)` | `T.serial` 或向量指令 |
-| **向量计算** | 标量 `a + b` | `T.tile.add(c, a, b)` **必须在 V 作用域** |
-| **数据搬运** | 自动 | `T.copy` **必须在 `T.Scope("V")` 内** |
-| **同步** | 自动 | `T.set_flag`/`T.wait_flag` (流水线同步) |
-| **作用域** | 无 | `with T.Scope("V"):` **V 核专用** |
-| **向量化因子** | 无 | `VEC_NUM = 2` |
+### 内存分配 API
 
-### NPU Kernel 基本模板
+| Expert模式 | Developer模式 | 存储层级 | 用途 |
+|-----------|-------------|---------|------|
+| `T.alloc_L1(shape, dtype)` | `T.alloc_shared(shape, dtype)` | L1 Buffer | Cube数据中转 |
+| `T.alloc_L0A(shape, dtype)` | - | L0A Buffer | Cube左矩阵输入(仅mma) |
+| `T.alloc_L0B(shape, dtype)` | - | L0B Buffer | Cube右矩阵输入(仅mma) |
+| `T.alloc_L0C(shape, dtype)` | `T.alloc_fragment(shape, dtype)` | L0C Buffer | Cube输出/累加 |
+| `T.alloc_ub(shape, dtype)` | `T.alloc_shared(shape, dtype)` | UB | Vector数据/计算 |
+
+## ⚠️ 核心 API (必读)
+
+### GEMM API
+
+| API | 说明 |
+|-----|------|
+| `T.gemm_v0(A, B, C, transpose_A=False, transpose_B=False, init=False)` | 块级矩阵乘 (A,B在L1; C在L0C) |
+| `T.mma(A, B, C, init=False)` | 底层矩阵乘累加 (A在L0A; B在L0B; C在L0C) |
+
+**init参数**: `init=True` 清零C后计算，`init=False` 累加。典型: `init=(k == 0)`
+
+### Vector Tile 指令
+
+| 类别 | API |
+|------|-----|
+| 算术 | `T.tile.add/sub/mul/div/max/min(dst, src0, src1)` -- src1可为scalar |
+| 单目 | `T.tile.exp/ln/abs/sqrt/rsqrt/relu/sigmoid/sin/cos(dst, src)` |
+| 激活 | `T.tile.leaky_relu(dst, src, scalar)`, `T.tile.axpy(dst, src, scalar)` |
+| 位运算 | `T.tile.bitwise_and/or/xor/not/lshift/rshift` |
+| 比较 | `T.tile.compare(dst, src0, src1, mode)` -- mode: "EQ","NE","GT","GE","LT","LE" |
+| 选择 | `T.tile.select(dst, mask, src0, src1, selMode)` |
+| 数据 | `T.tile.fill(buffer, value)`, `T.tile.clear(buffer)`, `T.tile.cast(dst, src, mode, count)` |
+| 转置 | `T.tile.transpose(dst, src)` -- 仅16x16 |
+| 索引 | `T.tile.createvecindex(dst, first_val)`, `T.tile.arith_progression(buf, first, diff, count)` |
+| 排序 | `T.tile.sort/merge_sort/topk` |
+| 收集 | `T.tile.gather/gather_mask` |
+| 标量变量 | `T.alloc_var(dtype, init, scope)` -- 标志位、计数器等 |
+| 归约 | `T.reduce_max/reduce_min/reduce_sum(buffer, out, dim)` |
+
+### 同步原语
+
+| API | 说明 |
+|-----|------|
+| `T.barrier_all()` | 全局屏障 |
+| `T.set_flag(src, dst, eventId)` | 核内流水线标志 |
+| `T.wait_flag(src, dst, eventId)` | 等待核内流水线标志 |
+| `T.set_cross_flag(pipe, flag)` | 核间同步标志 (Cube↔Vector) |
+| `T.wait_cross_flag(flag)` | 等待核间同步标志 |
+
+### Kernel 启动
 
 ```python
-import tilelang
-import tilelang.language as T
+# Cube操作 (不使用VEC_NUM)
+with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+    bx = cid // n_num
+    by = cid % n_num
 
-@tilelang.jit(out_idx=[-1])
-def my_op(M, N, block_M, block_N, dtype="float16"):
-    m_num = M // block_M
-    n_num = N // block_N
-    VEC_NUM = 2  # 向量化因子
+# Vector操作 (VEC_NUM=2)
+VEC_NUM = 2
+with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
+    bx = cid // n_num
+    by = cid % n_num
+```
 
+### T.copy 支持路径
+
+| src | dst | 说明 |
+|-----|-----|------|
+| GM | L1 | Cube数据加载 |
+| L1 | L0A/L0B | Cube矩阵输入 |
+| L0C | GM | Cube结果写回 |
+| GM | UB | Vector数据加载 |
+| UB | GM | Vector结果写回 |
+| UB | UB | UB间拷贝 |
+| UB | L1 | Vector到Cube数据传递 |
+
+### 调试工具
+
+```python
+# 设备端打印 (支持 %d %f %x %s)
+T.printf("val=%d\n", my_val)
+
+# 张量转储 (支持 ub/l1/l0c/global)
+T.dump_tensor(buf, desc_id, num_elements, shape_info=())
+
+# 查看生成的 AscendC 代码
+print(f"{func.get_kernel_source()}")
+```
+
+### T.Pipelined 用法
+
+```python
+# 核内流水线 (重叠 copy + gemm)
+for k in T.Pipelined(loop_k, num_stages=2):
+    T.copy(A[...], A_L1)
+    T.copy(B[...], B_L1)
+    T.gemm_v0(A_L1, B_L1, C_L0, init=(k==0))
+
+# 核间流水线 (重叠 Cube + Vector, 需 AUTO_CV_COMBINE + AUTO_CV_SYNC)
+for k in T.Pipelined(num_iters, num_stages=2, cross_interval=1):
+    # Cube writes workspace...
+    # Vector reads workspace...
+```
+
+### Workspace 自动分配
+
+```python
+@tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6, 7])
+def fused_op(...):
     @T.prim_func
     def main(
-        A: T.Tensor((M, N), dtype),
-        B: T.Tensor((M, N), dtype),
-        C: T.Tensor((M, N), dtype),
+        Input: ...,
+        Output: ...,           # out_idx=3
+        workspace_1: ...,      # workspace_idx=4, 自动管理
+        workspace_2: ...,      # workspace_idx=5, 自动管理
     ):
-        # NPU kernel: 线性索引 + is_npu=True
-        with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
-            # 计算当前block的2D坐标
+        ...
+# 用户调用: output = fused_op(input)  -- workspace自动分配
+```
+
+### pass_configs (Developer模式)
+
+```python
+pass_configs = {
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
+    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,  # 融合算子
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,      # 融合算子
+}
+```
+
+## ⚠️ GEMM 正确模式 (Expert)
+
+来源: `tilelang-ascend/examples/gemm/example_gemm.py`
+
+```python
+@tilelang.jit(out_idx=[-1])
+def matmul(M, N, K, block_M, block_N, K_L1, dtype="float16", accum_dtype="float"):
+    m_num = M // block_M
+    n_num = N // block_N
+
+    @T.prim_func
+    def main(A: T.Tensor((M, K), dtype), B: T.Tensor((K, N), dtype), C: T.Tensor((M, N), dtype)):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
             bx = cid // n_num
             by = cid % n_num
 
-            # NPU内存分配: alloc_ub
-            a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            A_L1 = T.alloc_L1((block_M, K_L1), dtype)
+            B_L1 = T.alloc_L1((K_L1, block_N), dtype)
+            C_L0 = T.alloc_L0C((block_M, block_N), accum_dtype)
 
-            # 数据搬运: GM -> UB + 向量计算 (V 作用域)
-            with T.Scope("V"):
-                # 数据搬运: GM -> UB (MTE2)
-                T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
-                T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
-
-                # MTE2 完成，设置标志通知 V 可以开始计算
-                T.set_flag("mte2", "v", 0)
-                # V 等待 MTE2 加载完成
-                T.wait_flag("mte2", "v", 0)
-
-                # 计算: 使用向量指令
-                T.tile.add(c_ub, a_ub, b_ub)
-
-                # V 计算完成，设置标志通知 MTE3 可以开始存储
-                T.set_flag("v", "mte3", 0)
-                # MTE3 等待 V 计算完成
-                T.wait_flag("v", "mte3", 0)
-
-                # 数据搬运: UB -> GM (MTE3)
-                T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
-
+            with T.Scope("C"):
+                loop_k = T.ceildiv(K, K_L1)
+                for k in T.serial(loop_k):
+                    T.copy(A[bx * block_M, k * K_L1], A_L1)
+                    T.copy(B[k * K_L1, by * block_N], B_L1)
+                    T.barrier_all()
+                    T.gemm_v0(A_L1, B_L1, C_L0, init=(k == 0))
+                    T.barrier_all()
+                T.copy(C_L0, C[bx * block_M, by * block_N])
     return main
 ```
 
-### NPU Multi-Block Kernel 模板
+## ⚠️ Vector Add 正确模式 (Expert)
 
-当数据量大于可用核数时，每个核需要循环处理多个数据块：
+来源: `tilelang-ascend/examples/elementwise/elementwise_add.py`
 
 ```python
 @tilelang.jit(out_idx=[-1])
-def my_op_multiblock(N, block_N, num_cores=24, dtype="float16"):
-    total_blocks = N // block_N
-    blocks_per_core = (total_blocks + num_cores - 1) // num_cores  # 向上取整
+def vec_add(M, N, block_M, block_N, dtype="float"):
+    m_num = M // block_M
+    n_num = N // block_N
     VEC_NUM = 2
 
     @T.prim_func
-    def main(
-        A: T.Tensor((N,), dtype),
-        B: T.Tensor((N,), dtype),
-        C: T.Tensor((N,), dtype),
-    ):
-        with T.Kernel(num_cores, is_npu=True) as (cid, vid):
-            a_ub = T.alloc_ub((block_N // VEC_NUM,), dtype)
-            b_ub = T.alloc_ub((block_N // VEC_NUM,), dtype)
-            c_ub = T.alloc_ub((block_N // VEC_NUM,), dtype)
-
-            for i in T.serial(blocks_per_core):
-                block_idx = cid * blocks_per_core + i
-                if block_idx < total_blocks:  # 边界检查
-                    with T.Scope("V"):
-                        T.copy(A[block_idx * block_N + vid * block_N // VEC_NUM], a_ub)
-                        T.copy(B[block_idx * block_N + vid * block_N // VEC_NUM], b_ub)
-                        T.set_flag("mte2", "v", 0)
-                        T.wait_flag("mte2", "v", 0)
-                        T.tile.add(c_ub, a_ub, b_ub)
-                        T.set_flag("v", "mte3", 0)
-                        T.wait_flag("v", "mte3", 0)
-                        T.copy(c_ub, C[block_idx * block_N + vid * block_N // VEC_NUM])
-                        T.barrier_all()  # ⚠️ 必须加！防止跨迭代flag冲突
-
+    def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype), C: T.Tensor((M, N), dtype)):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
+            bx = cid // n_num
+            by = cid % n_num
+            a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
+            with T.Scope("V"):
+                T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
+                T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
+                T.barrier_all()
+                T.tile.add(c_ub, a_ub, b_ub)
+                T.barrier_all()
+                T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
     return main
 ```
 
-**关键点**：
-1. `blocks_per_core` 使用向上取整：`(total_blocks + num_cores - 1) // num_cores`
-2. `if block_idx < total_blocks:` 边界检查跳过多余block
-3. **`T.barrier_all()` 必须在每次迭代末尾调用**，否则 `set_flag/wait_flag` 的固定 `stage_id=0` 会在跨迭代时产生同步混乱，导致从位置0开始的全量数据错误
+## ⚠️ 禁止使用的 API (来自上游 GPU TileLang)
+
+| 禁止使用 | 正确替代 |
+|---------|---------|
+| `T.gemm(A, B, C)` | `T.gemm_v0(A_L1, B_L1, C_L0C, init=...)` |
+| `T.gemm(..., clear_accum=True)` | `T.gemm_v0(..., init=True)` 或 `init=(k==0)` |
+| `T.clear(buf)` | `T.gemm_v0(..., init=True)` (GEMM) 或 `T.tile.fill(buf, 0.0)` (Vector) |
+| `T.fill(buf, val)` (顶层) | `T.tile.fill(buf, val)` (Vector域) |
+| `T.alloc_shared` (Expert模式) | `T.alloc_L1` (Cube) 或 `T.alloc_ub` (Vector) |
+| `T.alloc_fragment` (Expert模式) | `T.alloc_L0C` (GEMM输出) |
+| `T.float16`, `T.bfloat16` | 字符串 `"float16"`, `"bfloat16"` |
+| `T.Parallel` (Expert模式) | `T.tile.*` 向量指令 |
+| `T.Pipelined` (Expert模式) | `T.serial` + 手动流水线 |
+| `threads=N` | `is_npu=True` |
+
+## 数据类型
+
+**dtype参数使用字符串**: `"float16"`, `"float32"`, `"float"`, `"bfloat16"`, `"int8"`, `"int32"`
+
+## 数据创建与验证
+
+```python
+import torch
+
+torch.manual_seed(0)
+
+# float16数据
+a = torch.randn(M, K).half().npu()
+b = torch.randn(K, N).half().npu()
+
+# float32数据
+a = torch.randn(M, N).npu()
+
+# 调用kernel
+func = matmul(M, N, K, 128, 256, 64)
+c = func(a, b)
+
+# 精度对比
+ref_c = a @ b  # NPU上直接对比
+torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+```
+
+## ⚠️ 防止硬件地址越界
+
+| 存储单元 | 对齐要求 | Buffer容量 |
+|---------|---------|-----------|
+| **UB** | 32字节 | ≤ 2MB (910B) |
+| **L1** | 32字节 | ≤ 1MB (910B) |
+| **L0A/L0B** | 512字节 | - |
+| **L0C** | 64字节 | - |
+
+- block_M/block_N/block_K 必须是 **分形大小(16或32)** 的整数倍
+- `T.set_flag`/`T.wait_flag` 和 `T.set_cross_flag`/`T.wait_cross_flag` **必须成对使用**
+
+**详细约束**: `skills/tl-op-hardware-constraints/SKILL.md`
+
+## 仓库结构
 
 ```
 AutoGen/
 ├── skills/                          # Skill提示词目录
-│   ├── tl-op-pipeline/              # 新增算子通路技能
-│   │   └── SKILL.md
+│   ├── tl-op-pipeline/              # 算子生成入口 (分发器)
+│   ├── tl-op-vector/                # 纯向量算子 (Vector Core Only)
+│   ├── tl-op-cube/                  # 纯矩阵算子 (Cube Core Only)
+│   ├── tl-op-fused/                 # 融合算子 (Cube + Vector)
 │   ├── tl-op-edit/                  # 修改算子技能
-│   │   └── SKILL.md
 │   ├── tl-op-rename/                # 重命名算子技能
-│   │   └── SKILL.md
 │   ├── tl-op-test/                  # 生成测试技能
-│   │   └── SKILL.md
 │   ├── tl-op-benchmark/             # 生成benchmark技能
-│   │   └── SKILL.md
 │   └── tl-op-hardware-constraints/  # NPU硬件约束技能
-│       └── SKILL.md
-├── templates/                       # 模板目录
-│   └── op_frame/
-│       ├── empty_op_template/       # 空白算子模板
-│       │   ├── your_op_name.py      # 核心kernel实现
-│       │   ├── test_your_op_name.py # 单元测试
-│       │   ├── benchmark_your_op_name.py # 性能测试
-│       │   └── README.md            # 算子文档
-│       └── gemm_reference/          # GEMM参考实现
-│           ├── gemm.py
-│           ├── test_gemm.py
-│           └── README.md
+├── templates/op_frame/              # 模板目录
+│   ├── empty_op_template/           # 空白算子模板
+│   └── gemm_reference/              # GEMM参考实现
 ├── projects/                        # 生成的算子项目目录
-│   └── vector_add/                  # Vector Add示例
+│   ├── matmul/                      # GEMM矩阵乘法
+│   ├── vector_add/                  # 向量加法
+│   ├── softmax/                     # 在线Softmax
+│   └── layer_norm/                  # Layer Normalization
+├── TileLangQuickStart/              # 快速入门文档
 ├── CLAUDE.md                        # 本文件
 └── README.md                        # 仓库说明
 ```
 
 ## 可用技能
 
-### tl-op-pipeline
-新增TileLang算子时使用。提供输入模板，并基于模板目录生成完整的算子实现。
+### tl-op-pipeline (入口分发器)
+新增TileLang算子时的入口技能。根据算子类型自动分发：
+- **无矩阵乘法** → `tl-op-vector` (纯向量计算)
+- **仅矩阵乘法** → `tl-op-cube` (纯GEMM)
+- **矩阵乘法+后处理** → `tl-op-fused` (融合算子)
 
-### tl-op-hardware-constraints
-检查算子代码是否符合不同NPU（如910B、910A、310P等）的硬件约束。
+### tl-op-vector (纯向量算子)
+生成仅使用 Vector Core 的算子: add, mul, relu, softmax, layernorm 等。
+- Expert: `T.alloc_ub` + `T.tile.*` + `T.Scope("V")`
+- Developer: `T.alloc_shared` + `T.Parallel` + pass_configs
 
-## NPU 向量指令
+### tl-op-cube (纯矩阵乘法)
+生成仅使用 Cube Core 的算子: GEMM (C = A @ B), 含转置和持久化变体。
+- Expert: `T.alloc_L1` + `T.alloc_L0C` + `T.gemm_v0` + `T.Scope("C")`
+- Developer: `T.alloc_shared` + `T.alloc_fragment` + `T.gemm_v0`
 
-| 指令 | 说明 |
-|------|------|
-| `T.tile.add(C, A, B)` | 向量加法 C = A + B |
-| `T.tile.mul(C, A, B)` | 向量乘法 C = A * B |
-| `T.tile.sub(C, A, B)` | 向量减法 C = A - B |
-| `T.tile.div(C, A, B)` | 向量除法 C = A / B |
-| `T.gemm(A, B, C)` | 矩阵乘法 C += A @ B |
-
-## NPU 内存操作
-
-| 函数 | 说明 |
-|------|------|
-| `T.alloc_ub(shape, dtype)` | 分配 Unified Buffer |
-| `T.fill(buffer, value)` | 填充buffer |
-| `T.copy(src, dst)` | 数据拷贝 |
-
-## NPU 同步原语
-
-| 函数 | 说明 |
-|------|------|
-| `T.set_flag("mte2", "v", stage_id)` | MTE2完成，通知V可开始计算 |
-| `T.wait_flag("mte2", "v", stage_id)` | V等待MTE2加载完成 |
-| `T.set_flag("v", "mte3", stage_id)` | V完成，通知MTE3可开始存储 |
-| `T.wait_flag("v", "mte3", stage_id)` | MTE3等待V计算完成 |
-| `T.barrier_all()` | 所有核同步 (旧方式，不推荐) |
-| `T.barrier(tid)` | 指定核同步 |
-
-### 流水线同步模式 (推荐)
-
-```
-MTE2 (加载) --set_flag("mte2", "v", 0)--> V (计算) --set_flag("v", "mte3", 0)--> MTE3 (存储)
-                    |                              |                              |
-                    v                              v                              v
-              wait_flag                     wait_flag                      wait_flag
-```
-
-使用 `set_flag/wait_flag` 可以实现更细粒度的流水线同步，相比 `barrier_all` 有更好的并行性。
-- 第一个参数: 源引擎 ("mte2", "v", "mte3")
-- 第二个参数: 目标引擎 ("mte2", "v", "mte3")
-- 第三个参数: stage_id (用于多级流水线，简单场景用 0)
-
-## ⚠️ 防止硬件地址越界（重要）
-
-生成NPU算子时必须遵守以下硬件约束，否则会导致运行时错误：
-
-### 存储单元对齐要求
-
-| 存储单元 | 对齐要求 | 违反后果 |
-|---------|---------|---------|
-| **Unified Buffer** | 32字节 | 访问异常/性能下降 |
-| **L1 Buffer** | 32字节 | 数据搬运失败 |
-| **L0A/L0B Buffer** | 512字节 | 硬件执行异常 |
-| **L0C Buffer** | 64字节 | 计算结果错误 |
-
-### 数据搬运约束
-
-- 搬运到UB的数据必须按 **DataBlock (32字节)** 对齐
-- L1→L0A/L0B必须按 **分形大小** 对齐，剩余空间不足1个分形会导致硬件异常
-- block_M/block_N/block_K 必须是 **分形大小(16或32)** 的整数倍
-
-### 同步控制约束
-
-- `T.set_flag` 和 `T.wait_flag` **必须成对使用**
-- 参数必须**完全一致**（源引擎、目标引擎、stage_id）
-- **禁止连续设置**同一个EventID
-
-### Buffer容量约束
-
-- UB总使用量 ≤ 2MB (910B)
-- L1总使用量 ≤ 1MB (910B)
-- 流水线深度 × 单stageBuffer ≤ Buffer容量
-
-**详细约束请参考**: `skills/tl-op-hardware-constraints/SKILL.md`
+### tl-op-fused (融合算子)
+生成 Cube + Vector 融合算子: Matmul+Bias, Flash Attention 等。
+- Expert: workspace + `T.set_cross_flag`/`T.wait_cross_flag`
+- Developer: pass_configs AUTO_CV_COMBINE
 
 ## 开发流程
 
 1. 使用 `tl-op-pipeline` 技能生成算子框架
-2. **使用 `tl-op-hardware-constraints` 检查硬件约束** ⬅️ 新增
-3. 根据需求修改算子实现 (遵循NPU编程规范)
-4. 使用 `tl-op-test` 生成测试用例
-5. 使用 `tl-op-benchmark` 进行性能测试
-6. 如需修改，使用 `tl-op-edit` 调整参数
+2. 选择编程模式 (Expert / Developer)
+3. 检查硬件约束 (`tl-op-hardware-constraints`)
+4. 根据需求修改算子实现
+5. 使用 `tl-op-test` 生成测试用例
+6. 使用 `tl-op-benchmark` 进行性能测试
 
 ## 参考资料
 
+- **tilelang-ascend 仓库**: `M:\Desktop\tmp\AgentTest\TileLang\tilelang-ascend` (权威)
+- **GEMM示例**: `tilelang-ascend/examples/gemm/`
+- **Elementwise示例**: `tilelang-ascend/examples/elementwise/`
+- **Softmax示例**: `tilelang-ascend/examples/softmax/`
+- **Normalization示例**: `tilelang-ascend/examples/normalization/`
+- **Flash Attention示例**: `tilelang-ascend/examples/flash_attention/`
+- **API参考**: `tilelang-ascend/.agents/skills/tilelang-custom-skill/tilelang-api-best-practices/`
+- **Expert↔Developer对比**: `tilelang-ascend/.agents/skills/tilelang-custom-skill/tilelang-expert-to-developer/`
 - [TileLang-Ascend GitHub](https://github.com/tile-ai/tilelang-ascend)
-- [TileLang Documentation](https://tilelang.com/)
-- [TileLang-Ascend 开发指南](https://github.com/tile-ai/tilelang-ascend/blob/npuir/docs/开发指南.md)
