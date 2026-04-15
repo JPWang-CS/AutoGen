@@ -1,6 +1,6 @@
 ---
 name: tl-op-fused
-description: 生成融合算子（Cube矩阵乘法 + Vector向量后处理），如 Matmul+Bias+ReLU、Flash Attention、GEMM+Softmax、Matmul+GELU、Matmul+SiLU。基于 tilelang-ascend/examples/flash_attention/flash_attn_bhsd.py 和 simple_fusion/matmul_add.py 实际示例。需要同时使用 Cube Core 和 Vector Core，通过workspace+cross_flag或pass_configs自动CV分离实现数据传递。
+description: 生成融合算子（Cube矩阵乘法 + Vector向量后处理），如 Matmul+Bias+ReLU、Flash Attention、GEMM+Softmax、Matmul+GELU、Matmul+SiLU、Quantized Matmul。基于 tilelang-ascend/examples/flash_attention/flash_attn_bhsd.py 和 pipeline/matmul_add_pipeline.py 实际示例。需要同时使用 Cube Core 和 Vector Core，通过workspace+cross_flag或pass_configs自动CV分离实现数据传递。支持T.Pipelined核间流水线优化。
 ---
 
 # 融合算子技能 (Cube + Vector)
@@ -284,6 +284,181 @@ def matmul_add(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype=
 - **无workspace**: 简单融合直接复用输出tensor C 作为中转
 - **Expert模式**: 明确的 `T.Scope("C")` 和 `T.Scope("V")` 分离
 
+## Matmul + Add Pipelined (Developer模式, 流水线融合)
+
+来源: `tilelang-ascend/examples/pipeline/matmul_add_pipeline.py`
+
+使用 `T.Pipelined` 实现核间流水线，重叠 Cube GEMM 和 Vector Add:
+
+```python
+@tilelang.jit(
+    out_idx=[2],
+    workspace_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
+        tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
+        tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
+        tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
+    },
+)
+def matmul_add_pipeline(M, N, K, block_M, block_N, block_K,
+                        dtype="float16", accum_dtype="float"):
+    m_num = M // block_M
+    n_num = N // block_N
+    VEC_NUM = 2
+    vec_proc = 4
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), dtype),
+        D: T.Tensor((M, N), dtype),
+        workspace_1: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
+            bx = cid // n_num
+            by = cid % n_num
+            A_L1 = T.alloc_shared((block_M, block_K), dtype)
+            B_L1 = T.alloc_shared((block_K, block_N), dtype)
+            C_L0 = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+            c_ub = T.alloc_shared((block_M // VEC_NUM, block_N // vec_proc), dtype)
+            d_ub = T.alloc_shared((block_M // VEC_NUM, block_N // vec_proc), dtype)
+            e_ub = T.alloc_shared((block_M // VEC_NUM, block_N // vec_proc), dtype)
+
+            # Cube域: Pipelined GEMM
+            loop_k = T.ceildiv(K, block_K)
+            for k in T.Pipelined(loop_k, num_stages=3):
+                T.copy(A[bx * block_M, k * block_K], A_L1)
+                T.copy(B[k * block_K, by * block_N], B_L1)
+
+                if k == 0:
+                    T.gemm_v0(A_L1, B_L1, C_L0, init=True)
+                else:
+                    T.gemm_v0(A_L1, B_L1, C_L0)
+
+            T.copy(C_L0, workspace_1[bx * block_M, by * block_N])
+
+            # Vector域: 逐块Add (VEC_NUM和vec_proc分割)
+            for i in T.Pipelined(vec_proc, num_stages=2):
+                T.copy(workspace_1[bx*block_M + vid*block_M//VEC_NUM,
+                                   by*block_N + i*block_N//vec_proc], c_ub)
+                T.copy(D[bx*block_M + vid*block_M//VEC_NUM,
+                         by*block_N + i*block_N//vec_proc], d_ub)
+
+                for j, k in T.Parallel(block_M // VEC_NUM, block_N // vec_proc):
+                    e_ub[j, k] = c_ub[j, k] + d_ub[j, k]
+
+                T.copy(e_ub, C[bx*block_M + vid*block_M//VEC_NUM,
+                               by*block_N + i*block_N//vec_proc])
+
+    return main
+```
+
+**要点**:
+- **workspace_idx=[-1]**: 最后一个参数是自动分配的workspace
+- **Cube用 `T.Pipelined(loop_k, num_stages=3)`**: 核内流水线重叠copy+gemm
+- **Vector用 `T.Pipelined(vec_proc, num_stages=2)`**: 核内流水线重叠load+compute+store
+- **vec_proc=4**: Vector端每个block再切4个子块，每个AIV处理更细粒度
+- **`T.Parallel` 用于Developer模式**: 在Vector域用标量语法做elementwise add
+- **`out_idx=[2]`**: 第3个参数(C)是输出，D是bias输入
+
+## Quantized Batch Matmul (量化矩阵乘法融合)
+
+来源: `tilelang-ascend/examples/quant_batch_matmul/example_quant_batch_matmul.py`
+
+int8输入 -> int32累加 -> float32缩放 -> float16/bfloat16输出:
+
+```python
+@tilelang.jit(
+    out_idx=[3],
+    workspace_idx=[4],
+    pass_configs={
+        tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
+        tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
+        tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
+    }
+)
+def quant_batch_matmul(Batch, M, N, K, scale_size,  # "1" 或 "N"
+                       block_M, block_N, block_K,
+                       in_dtype="int8", out_dtype="float16",
+                       accum_dtype="int32", scale_dtype="float32"):
+    VEC_NUM = 2
+    CAST_MODE = "CAST_RINT"
+    N_scale = N if scale_size == "N" else 1
+    m_num = T.ceildiv(M, block_M)
+    n_num = T.ceildiv(N, block_N)
+    k_num = T.ceildiv(K, block_K)
+    block_M_2 = T.ceildiv(block_M, VEC_NUM)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor([Batch, M, K], in_dtype),
+        B: T.Tensor([Batch, K, N], in_dtype),
+        scale: T.Tensor([N_scale], scale_dtype),
+        C: T.Tensor([Batch, M, N], out_dtype),
+        workspace_1: T.Tensor([Batch, M, N], accum_dtype),
+    ):
+        with T.Kernel(Batch * m_num * n_num, is_npu=True) as (cid, vid):
+            bb = cid // (m_num * n_num)
+            bm = (cid % (m_num * n_num)) // n_num
+            bn = (cid % (m_num * n_num)) % n_num
+
+            A_L1 = T.alloc_L1([block_M, block_K], in_dtype)
+            B_L1 = T.alloc_L1([block_K, block_N], in_dtype)
+            C_L0 = T.alloc_L0C([block_M, block_N], accum_dtype)
+
+            c_ub = T.alloc_ub([block_M_2, block_N], accum_dtype)
+            c_scale = T.alloc_ub([block_M_2, block_N], scale_dtype)
+            c_out = T.alloc_ub([block_M_2, block_N], out_dtype)
+            scale_ub = T.alloc_ub([block_N], scale_dtype)
+
+            # Cube域: int8 GEMM -> int32累加
+            for bk in T.serial(k_num):
+                T.copy(A[bb, bm*block_M, bk*block_K], A_L1)
+                T.copy(B[bb, bk*block_K, bn*block_N], B_L1)
+                T.gemm_v0(A_L1, B_L1, C_L0, init=(bk == 0))
+
+            T.copy(C_L0, workspace_1[bb, bm*block_M, bn*block_N])
+
+            # Vector域: int32 -> scale -> output_dtype
+            T.copy(workspace_1[bb, bm*block_M + vid*block_M_2,
+                               bn*block_N], c_ub)
+            if scale_size == "N":
+                T.copy(scale[bn * block_N], scale_ub)
+            else:
+                T.copy(scale[0], scale_ub)
+                T.tile.fill(scale_ub, scale_ub[0])
+
+            if accum_dtype != scale_dtype:
+                T.tile.cast(c_scale, c_ub, mode=CAST_MODE,
+                           count=block_M_2 * block_N)
+            else:
+                T.copy(c_ub, c_scale)
+
+            for bm_v, bn_v in T.Parallel(block_M_2, block_N):
+                c_scale[bm_v, bn_v] *= scale_ub[bn_v]
+
+            if out_dtype != scale_dtype:
+                T.tile.cast(c_out, c_scale, mode=CAST_MODE,
+                           count=block_M_2 * block_N)
+            else:
+                T.copy(c_scale, c_out)
+
+            T.copy(c_out, C[bb, bm*block_M + vid*block_M_2, bn*block_N])
+
+    return main
+```
+
+**要点**:
+- **Cube域**: int8 GEMM累加到int32 (accum_dtype="int32")
+- **Vector域**: int32 -> cast -> scale乘法 -> cast -> float16/bfloat16
+- **scale_size**: "1" 表示per-tensor量化, "N" 表示per-channel量化
+- **workspace**: int32中间结果暂存 (workspace_idx=[4])
+- **`T.tile.cast`**: 精度转换, mode="CAST_RINT" 为四舍五入
+- **Developer模式**: AUTO_CV_COMBINE自动分离Cube和Vector操作
+
 ## Developer模式自动CV分离
 
 使用pass_configs自动处理Cube↔Vector同步和数据传递:
@@ -354,6 +529,91 @@ pass_configs = {
 
 ## 融合算子设计原则
 
+### Flash Attention 性能优化参考数据
+
+来源: `tilelang-ascend/examples/flash_attention/fa_opt/bench_mark.md`
+
+FA算子 (B=1, Q_N=12, D=128, block_size=128) 优化过程及性能:
+
+| 优化步骤 | 相对原生AscendC性能 | 说明 |
+|----------|:-------------------:|------|
+| L1驻留 (Q矩阵常驻L1) | - | 减少GM访问 |
+| 指令向量化 (标量→tile) | 36% | 消除循环开销 |
+| 多缓冲 (Double Buffer) | - | 隐藏数据传输延迟 |
+| 核内冗余同步消除 | 50% | 减少不必要的barrier |
+| T.Pipelined核间流水线 (num_stages=8) | 60% | Cube/Vector重叠执行 |
+| 优化核间同步频率 (每2次同步1次) | 72% | 减少scalar bound |
+| 指令合并 (axpy替代mul+sub) | 80% | 减少指令派发数 |
+
+**Expert模式**: 80% 原生性能 | **Developer模式 (auto_pipeline)**: 60% 原生性能
+
+**不同序列长度对比**:
+
+| S (序列长度) | AscendC | TileLang | 比例 |
+|-------------|---------|----------|------|
+| 32K | 37555us | 46643us | 80.52% |
+| 64K | 149578us | 185188us | 80.77% |
+| 128K | 600018us | 741211us | 80.95% |
+
+### num_stages选择指南
+
+来源: `tilelang-ascend/examples/flash_attention/fa_opt/flash_attention_performance_optimization.md`
+
+```
+num_stages = 2:
+  C-core: [C0]--------[C1]--------[C2]
+  V-core:      [V0]--------[V1]--------[V2]
+               ↑ C1需等V0完成才能开始
+
+num_stages = 3:
+  C-core: [C0][C1]----[C2]----[C3]
+  V-core:     [V0][V1]----[V2]----[V3]
+               ↑ bubble减少
+
+num_stages = 8 (FA最优):
+  更多的缓冲级进一步减少等待
+```
+
+**调优建议**:
+- 从 `num_stages=2` 开始，逐步增加
+- 观察C/V core时间比例，选择最小化bubble的值
+- 过大的num_stages增加内存占用但不一定提升性能
+- FA场景中 `num_stages=8` 配合同步频率优化效果最好
+
+### 核间同步频率优化
+
+减少cross_flag同步次数可以提升性能:
+
+```python
+# 差: 每次都同步
+for k in range(loop_k):
+    cube_process(k)
+    sync()    # 每次迭代同步
+    vector_process(k)
+    sync()
+
+# 好: 每N次同步一次
+for k in range(loop_k):
+    cube_process(k)
+    vector_process(k)
+    if k % 2 == 1:  # 每2次同步一次
+        sync()
+```
+
+**性能影响**: FA优化中从每次同步改为每2次同步，性能从60%提升到72%。
+
+### 优化检查清单 (融合算子)
+
+- [ ] 使用 workspace 传递 Cube->Vector 数据 (workspace_idx)
+- [ ] 开启 AUTO_CV_COMBINE + AUTO_CV_SYNC (Developer模式)
+- [ ] 考虑 T.Pipelined 实现核间流水线 (从num_stages=2开始)
+- [ ] Cube域使用 alloc_L1/alloc_shared + alloc_L0C/alloc_fragment
+- [ ] Vector域使用 alloc_ub/alloc_shared + VEC_NUM=2 分割
+- [ ] 检查UB总量 <= 2MB, L1总量 <= 1MB
+- [ ] 标量操作向量化 (用T.tile.*替代循环)
+- [ ] 减少不必要的核间同步
+- [ ] 使用 do_bench 或 msprof 对比时延
+
 ### 1. 最小化GM访问次数
 
 ```python
@@ -410,8 +670,13 @@ acc_s_ub = T.alloc_ub([block_M // 2, block_N], accum_dtype)  # UB
 - Flash Attention (cc_sync): `tilelang-ascend/examples/flash_attention/flash_attn_bhsd_cc_sync.py`
 - Paged Flash Attention: `tilelang-ascend/examples/flash_attention/paged_flash_attn_bhsd.py`
 - FA优化版: `tilelang-ascend/examples/flash_attention/fa_opt/`
+- FA性能数据: `tilelang-ascend/examples/flash_attention/fa_opt/bench_mark.md`
+- FA性能优化指南: `tilelang-ascend/examples/flash_attention/fa_opt/flash_attention_performance_optimization.md`
 - **Matmul+Add融合**: `tilelang-ascend/examples/simple_fusion/matmul_add.py`
+- **Matmul+Add Pipelined**: `tilelang-ascend/examples/pipeline/matmul_add_pipeline.py`
+- Matmul+Add (developer): `tilelang-ascend/examples/developer_mode/matmul_add_developer.py`
 - Matmul+Add (infer_scope): `tilelang-ascend/examples/simple_fusion/matmul_add_infer_scope.py`
+- **Quantized Batch Matmul**: `tilelang-ascend/examples/quant_batch_matmul/example_quant_batch_matmul.py`
 - API参考: `tilelang-ascend/.agents/skills/tilelang-custom-skill/tilelang-api-best-practices/`
 - Expert↔Developer对比: `tilelang-ascend/.agents/skills/tilelang-custom-skill/tilelang-expert-to-developer/`
 - GEMM参考: `skills/tl-op-cube/SKILL.md`

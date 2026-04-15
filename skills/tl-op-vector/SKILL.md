@@ -1016,6 +1016,126 @@ MTE2 (加载) --set_flag("mte2", "v", 0)--> V (计算) --set_flag("v", "mte3", 0
 - **T.tile.fill 在NPU上可用**: 可以使用 `T.tile.fill(buffer, value)` 填充buffer
 - **硬件约束**: 参考 `tl-op-hardware-constraints`
 
+---
+
+## 性能优化策略
+
+### VEC_NUM选择
+
+| VEC_NUM | 说明 | 适用场景 |
+|---------|------|---------|
+| `2` | 默认值，每个AIC有2个AIV | 几乎所有Vector算子 |
+| 不使用 | Cube操作 | tl-op-cube 技能 |
+
+**VEC_NUM=2的影响**:
+- UB分配: `shape[0] = block_M // VEC_NUM` — 每个AIV处理一半行
+- 数据加载: `vid * block_M // VEC_NUM` — vid=0前半，vid=1后半
+- 计算并行: 两个AIV同时执行相同的 T.tile.* 指令
+
+### Block Size调优
+
+**来源**: `tilelang-ascend/examples/` 各Vector示例的典型配置
+
+| 场景 | block_M | block_N | 说明 |
+|------|---------|---------|------|
+| **Elementwise Add** | 128 | 256 | 默认配置 |
+| **Pipeline Add** | 128 | 128, sub_M=32 | sub_M控制每次处理的子块 |
+| **Sigmoid/SiLU** | 128 | 256 | 与Add相同 |
+| **RMS Norm** | 动态 | 动态 (block_N) | 沿N维分块累加 |
+| **GEMV** | - | block_N | 只有N维分块 |
+
+**选择原则**:
+1. **UB总量 <= 2MB (910B)**: 所有 `T.alloc_ub` 的总量
+2. **block_M是VEC_NUM的倍数**: block_M // 2 必须为整数
+3. **block_N为32的倍数**: 内存对齐要求
+4. **UB buffer数量**: 每增加一个临时buffer，可用空间减少
+5. **推荐起始值**: block_M=128, block_N=256
+
+**UB容量计算**:
+```python
+# float32 元素 = 4 bytes
+# 3个 (64, 256) buffer: 3 * 64 * 256 * 4 = 196,608 bytes = ~192KB
+# 远小于 2MB，可以增大block或增加buffer
+
+# float16 元素 = 2 bytes
+# 5个 (64, 512) buffer: 5 * 64 * 512 * 2 = 327,680 bytes = ~320KB
+```
+
+### 流水线优化 (MTE2-V-MTE3)
+
+来源: `tilelang-ascend/examples/elementwise/elementwise_add_pipeline.py`
+
+Vector Core内部有三个独立的指令队列，可以并行执行:
+- **MTE2**: GM -> UB 数据加载
+- **VEC (Vector)**: 向量计算 (T.tile.*)
+- **MTE3**: UB -> GM 数据存储
+
+**串行 vs 双缓冲流水线**:
+
+```
+串行模式:
+  Block0: [MTE2][VEC][MTE3]
+  Block1:               [MTE2][VEC][MTE3]
+
+双缓冲流水线 (stages=2):
+  Block0: [MTE2_0][VEC_0][MTE3_0]
+  Block1:    [MTE2_1][VEC_1][MTE3_1]
+  → MTE2_1 和 VEC_0 重叠执行
+```
+
+**何时使用流水线**:
+- **数据量大**: 当总数据量需要多个子块处理时
+- **计算密集**: VEC计算时间与MTE2/MTE3传输时间接近时效果最好
+- **UB空间足够**: 需要额外的缓冲级 (stages维)
+
+**流水线关键参数**:
+- `stages=2`: 双缓冲 (最小推荐值)
+- `sub_M`: 每个子块的行数 (block_M // vec_proc)
+- `vec_proc`: 每个block内的子块数量
+
+### 标量向量化
+
+来源: `tilelang-ascend/examples/flash_attention/fa_opt/flash_attention_performance_optimization.md`
+
+将循环中的标量操作转换为单条tile指令:
+
+```python
+# 差: 多条标量指令 (循环中逐行操作)
+for h_i in range(block_M // 2):
+    T.tile.sub(acc_s_ub[h_i, :], acc_s_ub[h_i, :], m_i[h_i])
+
+# 好: 一条向量指令 (广播后整体操作)
+T.tile.broadcast(m_i_2d, m_i, tmp_ub)
+T.tile.sub(acc_s_ub, acc_s_ub, m_i_2d)
+```
+
+**性能提升**: 消除循环开销，减少指令派发次数。FA优化中这一步带来约36%性能提升。
+
+### 指令合并 (Axpy)
+
+使用融合指令替代多条独立指令:
+
+```python
+# 差: 两条独立指令
+T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)    # 乘以标量
+T.tile.sub(acc_s_ub, acc_s_ub, m_i_2d)      # 减去m_i
+
+# 好: 一条融合指令
+T.tile.axpy(acc_s_ub, acc_s_ub, scalar)      # dst += scalar * src
+```
+
+**性能提升**: FA优化中使用axpy替代mul+sub，结合其他优化达到80%原生性能。
+
+### 优化检查清单
+
+- [ ] block_M/N 选择是否合理 (UB总量 <= 2MB)
+- [ ] block_M 是否为 VEC_NUM (2) 的整数倍
+- [ ] 数据量大时考虑流水线 (stages=2, sub_M分块)
+- [ ] 循环中标量操作是否可以替换为 tile 向量化
+- [ ] 多条连续算术指令是否可以用 axpy 合并
+- [ ] Developer模式开启 AUTO_SYNC 和 MEMORY_PLANNING
+- [ ] 使用 `func.get_kernel_source()` 检查生成的代码
+
 ## 参考
 
 - Elementwise Add示例: `tilelang-ascend/examples/elementwise/elementwise_add.py`
